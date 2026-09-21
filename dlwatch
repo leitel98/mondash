@@ -1,0 +1,676 @@
+#!/usr/bin/env python3
+"""dlwatch — see everything that is downloading right now, with a live bar for each.
+
+Usage:
+  dlwatch                 auto mode: finds every download in progress (curl, wget,
+                          aria2c, flatpak, rsync, git, scp, pip, Steam) and shows a live bar
+  dlwatch -w              same, in its own terminal window
+  dlwatch DIR [TOTAL]     folder mode: watch a folder fill up. TOTAL is a file count
+                          (93) or a size (4.7G). Options: -p '*.zip'  -l file.log
+
+Keys: q quits.
+
+Needs: python3, psutil, rich, requests   (pip install --user rich psutil requests)
+"""
+from __future__ import annotations
+
+import argparse
+import glob
+import os
+import re
+import select
+import shutil
+import subprocess
+import sys
+import termios
+import time
+import tty
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import psutil
+from rich.console import Console, Group
+from rich.live import Live
+from rich.progress_bar import ProgressBar
+from rich.table import Table
+from rich.text import Text
+
+# --------------------------------------------------------------------------- helpers
+
+DOWNLOADERS = {"curl", "wget", "aria2c", "rsync", "flatpak", "git", "git-remote-https", "scp", "pip", "pip3"}
+FILE_TOOLS = {"curl", "wget", "aria2c"}           # tools where one output file can be tracked
+URL_RE = re.compile(r"(?:https?|ftp)://[^\s\"']+")
+APPID_RE = re.compile(r"[A-Za-z0-9_]+(?:\.[A-Za-z0-9_-]+){2,}")
+SKIP_PREFIX = ("/dev/", "/proc/", "/sys/", "/run/")
+HOME = str(Path.home())
+
+
+def human(n: float) -> str:
+    n = float(n or 0)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return f"{n:.0f}{unit}" if unit == "B" else f"{n:.1f}{unit}"
+        n /= 1024
+    return f"{n:.1f}TB"
+
+
+def eta(seconds: float | None) -> str:
+    if seconds is None or seconds <= 0:
+        return "--"
+    s = int(seconds)
+    if s >= 3600:
+        return f"{s // 3600}h{s % 3600 // 60:02d}m"
+    return f"{s // 60}m{s % 60:02d}s"
+
+
+def shorten(path: str, width: int) -> str:
+    p = path.replace(HOME, "~", 1) if path.startswith(HOME) else path
+    if len(p) <= width:
+        return p
+    half = max(4, width // 2 - 1)
+    return p[:half] + "…" + p[-half:]
+
+
+def parse_total(text: str | None) -> tuple[str, int]:
+    """'93' -> ('count', 93);  '4.7G' -> ('bytes', N);  None -> ('none', 0)"""
+    if not text:
+        return "none", 0
+    if text.isdigit():
+        return "count", int(text)
+    m = re.fullmatch(r"(\d+\.?\d*)([KkMmGgTt])[Bb]?", text)
+    if not m:
+        sys.exit(f"dlwatch: bad TOTAL '{text}' (use 93, 800M, 4.2G)")
+    mult = {"k": 1024, "m": 1024**2, "g": 1024**3, "t": 1024**4}[m.group(2).lower()]
+    return "bytes", int(float(m.group(1)) * mult)
+
+
+def default_iface() -> str | None:
+    try:
+        for line in Path("/proc/net/route").read_text().splitlines()[1:]:
+            parts = line.split()
+            if parts[1] == "00000000":      # default route
+                return parts[0]
+    except OSError:
+        pass
+    stats = {k: v.bytes_recv for k, v in psutil.net_io_counters(pernic=True).items() if k != "lo"}
+    return max(stats, key=stats.get) if stats else None
+
+
+class NetMeter:
+    def __init__(self) -> None:
+        self.iface = default_iface()
+        self.prev = self._read()
+        self.rate = 0.0
+
+    def _read(self) -> int:
+        counters = psutil.net_io_counters(pernic=True)
+        return counters[self.iface].bytes_recv if self.iface in counters else 0
+
+    def tick(self, dt: float) -> float:
+        now = self._read()
+        self.rate = max(0.0, (now - self.prev) / dt)
+        self.prev = now
+        return self.rate
+
+
+class Keys:
+    """Non-blocking single-key reader. Does nothing if stdin is not a terminal."""
+
+    def __init__(self) -> None:
+        self.fd = sys.stdin.fileno() if sys.stdin.isatty() else None
+        self.saved = termios.tcgetattr(self.fd) if self.fd is not None else None
+
+    def __enter__(self) -> "Keys":
+        if self.fd is not None:
+            tty.setcbreak(self.fd)
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        if self.fd is not None:
+            termios.tcsetattr(self.fd, termios.TCSADRAIN, self.saved)
+
+    def poll(self) -> str | None:
+        if self.fd is None:
+            return None
+        ready, _, _ = select.select([sys.stdin], [], [], 0)
+        return sys.stdin.read(1) if ready else None
+
+
+def wait_or_quit(keys: Keys, seconds: float) -> bool:
+    """Sleep `seconds`, returning True early if 'q' was pressed."""
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        if keys.poll() == "q":
+            return True
+        time.sleep(0.1)
+    return False
+
+
+# --------------------------------------------------------------------------- auto mode
+
+class SizeProbe:
+    """Asks each URL once for Content-Length, in the background."""
+
+    def __init__(self) -> None:
+        self.pool = ThreadPoolExecutor(max_workers=4)
+        self.results: dict[str, int] = {}
+        self.pending: dict[str, object] = {}
+
+    def get(self, url: str) -> int:
+        if url in self.results:
+            return self.results[url]
+        fut = self.pending.get(url)
+        if fut is None:
+            self.pending[url] = self.pool.submit(self._head, url)
+        elif fut.done():
+            self.results[url] = fut.result()
+            del self.pending[url]
+            return self.results[url]
+        return 0
+
+    @staticmethod
+    def _head(url: str) -> int:
+        try:
+            import requests
+            r = requests.head(url, allow_redirects=True, timeout=12,
+                              headers={"User-Agent": "dlwatch-probe"})
+            return int(r.headers.get("Content-Length", 0))
+        except Exception:
+            return 0
+
+
+@dataclass
+class Download:
+    pid: int
+    tool: str
+    label: str
+    url: str | None
+    path: str | None
+    first_seen: float
+    fd: int | None = None
+    size: int = 0
+    total: int = 0
+    rate: float = 0.0
+    samples: int = 0
+    note: str = ""                       # extra status text (Steam: staging progress, paused)
+    last_change: float = 0.0
+    last_walk: float = 0.0
+    history: deque = field(default_factory=lambda: deque(maxlen=64))
+    reported: str = ""
+
+    @property
+    def name(self) -> str:
+        if self.tool == "steam":
+            return self.label
+        return os.path.basename(self.path) if self.path else self.label
+
+    def push_size(self, size: int, dt: float) -> None:
+        """Feed a size observed elsewhere (not from a file) into the smoothed rate."""
+        delta = max(0, size - self.size) / dt
+        if self.samples == 0:
+            self.rate = 0.0
+        elif self.samples == 1:
+            self.rate = delta
+        else:
+            self.rate = self.rate * 0.7 + delta * 0.3
+        self.size = size
+        self.samples += 1
+
+    def update_size(self, dt: float) -> None:
+        if not self.path and self.fd is None:
+            return
+        size = None
+        if self.fd is not None:                    # works even when the process lives in
+            try:                                   # another mount namespace (sandbox, container)
+                size = os.stat(f"/proc/{self.pid}/fd/{self.fd}").st_size
+            except OSError:
+                self.fd = None
+        if size is None and self.path:
+            try:
+                size = os.stat(self.path).st_size
+            except OSError:
+                return
+        if size is None:
+            return
+        delta = max(0, size - self.size) / dt
+        if self.samples == 0:
+            self.rate = 0.0                       # first look: no speed yet
+        elif self.samples == 1:
+            self.rate = delta                     # second look: raw speed
+        else:
+            self.rate = self.rate * 0.7 + delta * 0.3   # then smoothed
+        self.size = size
+        self.samples += 1
+
+    @property
+    def eta_seconds(self) -> float | None:
+        if self.total and self.rate > 0:
+            return (self.total - self.size) / self.rate
+        return None
+
+
+def output_from_args(args: list[str], tool: str = "", cwd: str | None = None) -> str | None:
+    out = None
+    for i, a in enumerate(args):
+        if tool == "curl" and a == "-O":           # curl -O: remote file name, no argument
+            url_m = URL_RE.search(" ".join(args))
+            out = os.path.basename(url_m.group(0).split("?")[0]) if url_m else None
+            break
+        for flag in ("-o", "--output", "-O", "--out", "-d", "--dir"):
+            if a == flag and i + 1 < len(args):
+                out = args[i + 1]
+                break
+            if a.startswith(flag + "="):
+                out = a.split("=", 1)[1]
+                break
+        if out is not None:
+            break
+    if not out or out == "-":                      # "-" is stdout, nothing to measure
+        return None
+    if not os.path.isabs(out) and cwd:
+        out = os.path.join(cwd, out)
+    return out
+
+
+def output_from_proc(proc: psutil.Process) -> tuple[str, int | None] | None:
+    try:
+        files = proc.open_files()
+    except (psutil.AccessDenied, psutil.NoSuchProcess):
+        return None
+    for f in files:
+        p = f.path
+        if p.startswith(SKIP_PREFIX) or ".so" in os.path.basename(p):
+            continue
+        if getattr(f, "mode", "w") in ("w", "a", "r+", "a+"):
+            fd = getattr(f, "fd", None)
+            if fd is not None and fd >= 0:
+                return p, fd                        # size read via /proc/<pid>/fd, path may be
+            if os.path.isfile(p):                   # invisible from here (other namespace)
+                return p, None
+    return None
+
+
+def describe(tool: str, args: list[str], url: str | None) -> str:
+    cmd = " ".join(args)
+    if tool == "flatpak":
+        m = APPID_RE.search(cmd)
+        return f"flatpak {m.group(0) if m else cmd[8:60]}"
+    if tool in ("rsync", "scp"):
+        return f"{tool} → {args[-1] if args else ''}"
+    if tool.startswith("git"):
+        return f"git {url or 'clone/fetch'}"
+    if tool.startswith("pip"):
+        return f"pip {args[-1] if args else ''}"
+    return url or cmd
+
+
+STEAM_ROOTS = ("~/.local/share/Steam", "~/.steam/steam", "~/.var/app/com.valvesoftware.Steam/.local/share/Steam")
+STEAM_FLAG_RUNNING = 1024           # StateFlags bit set while Steam is actively downloading/updating an app
+STEAM_FLAG_INSTALLED = 4
+ACF_KV_RE = re.compile(r'^\s*"([A-Za-z]+)"\s+"([^"]*)"', re.M)
+
+
+class SteamTracker:
+    """Steam downloads: read steamapps/appmanifest_*.acf in every library (no downloader process to watch)."""
+
+    def __init__(self) -> None:
+        self.libs = self._libraries()
+        self.known: set[int] = set()
+
+    @staticmethod
+    def _libraries() -> list[str]:
+        libs: dict[str, None] = {}
+        for root in STEAM_ROOTS:
+            root = os.path.expanduser(root)
+            if not os.path.isdir(os.path.join(root, "steamapps")):
+                continue
+            libs[os.path.realpath(root)] = None
+            try:
+                text = Path(root, "steamapps", "libraryfolders.vdf").read_text()
+            except OSError:
+                continue
+            for m in re.finditer(r'"path"\s+"([^"]+)"', text):
+                p = m.group(1).replace("\\\\", "/")
+                if os.path.isdir(os.path.join(p, "steamapps")):
+                    libs[os.path.realpath(p)] = None
+        return list(libs)
+
+    RATE_RE = re.compile(r"\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\] Current download rate: ([\d.]+) Mbps")
+
+    def _reported_rate(self) -> str:
+        """Steam's own 'Current download rate' from logs/content_log.txt, if it is less than two minutes old."""
+        for root in STEAM_ROOTS:
+            log = os.path.join(os.path.expanduser(root), "logs", "content_log.txt")
+            try:
+                with open(log, "rb") as fh:
+                    fh.seek(0, 2)
+                    fh.seek(max(0, fh.tell() - 8192))
+                    tail = fh.read().decode(errors="replace")
+            except OSError:
+                continue
+            hits = self.RATE_RE.findall(tail)
+            if not hits:
+                return ""
+            stamp, mbps = hits[-1]
+            try:
+                age = time.time() - time.mktime(time.strptime(stamp, "%Y-%m-%d %H:%M:%S"))
+            except ValueError:
+                return ""
+            return f"net {float(mbps):.1f} Mbps" if age < 120 else ""
+        return ""
+
+    @staticmethod
+    def _allocated(root: str) -> int | None:
+        """Bytes actually written under root (st_blocks, so preallocated sparse files don't count as done)."""
+        if not os.path.isdir(root):
+            return None
+        total = 0
+        stack = [root]
+        while stack:
+            try:
+                with os.scandir(stack.pop()) as it:
+                    for e in it:
+                        try:
+                            if e.is_dir(follow_symlinks=False):
+                                stack.append(e.path)
+                            elif e.is_file(follow_symlinks=False):
+                                total += e.stat(follow_symlinks=False).st_blocks * 512
+                        except OSError:
+                            continue
+            except OSError:
+                continue
+        return total
+
+    @staticmethod
+    def _manifest(path: str) -> dict[str, str]:
+        try:
+            text = Path(path).read_text(errors="replace")
+        except OSError:
+            return {}
+        out: dict[str, str] = {}
+        for k, v in ACF_KV_RE.findall(text):
+            out.setdefault(k, v)
+        return out
+
+    def scan(self, dt: float, active: dict[int, Download], finished: deque) -> set[int]:
+        """Update `active` with Steam entries (keyed by -appid). Returns the keys seen this round."""
+        seen: set[int] = set()
+        for lib in self.libs:
+            for mf in glob.glob(os.path.join(lib, "steamapps", "appmanifest_*.acf")):
+                try:
+                    appid = int(os.path.basename(mf)[12:-4])
+                except ValueError:
+                    continue
+                m = self._manifest(mf)
+                try:
+                    flags = int(m.get("StateFlags", "0"))
+                    total = int(m.get("BytesToDownload", "0"))
+                    done = int(m.get("BytesDownloaded", "0"))
+                    stage_total = int(m.get("BytesToStage", "0"))
+                    staged = int(m.get("BytesStaged", "0"))
+                except ValueError:
+                    continue
+                running = bool(flags & STEAM_FLAG_RUNNING)
+                queued = os.path.isdir(os.path.join(lib, "steamapps", "downloading", str(appid)))
+                if not running and not queued:
+                    continue
+                if total <= 0:                       # placeholder entries (redistributables) carry no size yet
+                    continue
+                key = -appid
+                seen.add(key)
+                d = active.get(key)
+                if d is None:
+                    install = os.path.join(lib, "steamapps", "common", m.get("installdir") or str(appid))
+                    d = Download(key, "steam", m.get("name") or f"app {appid}", None, install, time.monotonic())
+                    d.last_change = time.monotonic()
+                    active[key] = d
+                    self.known.add(appid)
+                # Steam only rewrites the manifest at checkpoints, so measure the download folder on disk
+                # (uncompressed, compared with BytesToStage); fall back to the manifest's compressed counters.
+                now = time.monotonic()
+                if now - d.last_walk >= 2.0:
+                    on_disk = self._allocated(os.path.join(lib, "steamapps", "downloading", str(appid))) if stage_total else None
+                    if on_disk is not None:
+                        d.total = stage_total
+                        size = min(stage_total, max(on_disk, staged))
+                    else:
+                        d.total = total
+                        size = done
+                    if size != d.size:
+                        d.last_change = now
+                    d.size = size
+                    d.samples += 1
+                    d.history.append((now, size))                     # bursty writer: average over ~60 s
+                    while len(d.history) > 2 and now - d.history[0][0] > 60:
+                        d.history.popleft()
+                    (t0, s0), (t1, s1) = d.history[0], d.history[-1]
+                    d.rate = max(0.0, (s1 - s0) / (t1 - t0)) if t1 > t0 else 0.0
+                    d.last_walk = now
+                notes = []
+                if not running:
+                    notes.append("paused")
+                elif d.samples > 2 and now - d.last_change > 10:
+                    notes.append("stalled")            # e.g. Steam pauses downloads while a game is running
+                if stage_total and staged * 100 // stage_total > 0 and staged < stage_total:
+                    notes.append(f"committed {min(100, staged * 100 // stage_total)}%")   # moved into the game folder
+                if running and now - d.last_walk < 0.01:                    # a walk just happened: refresh the log note
+                    d.reported = self._reported_rate()
+                if d.reported:
+                    notes.append(d.reported)
+                d.note = " · ".join(notes)
+        for key in list(active):
+            if key < 0 and key not in seen and active[key].tool == "steam":
+                d = active.pop(key)
+                if d.total and d.size >= d.total * 0.95:
+                    finished.appendleft((time.strftime("%H:%M:%S"), d.label, d.total))
+        return seen
+
+
+class Tracker:
+    def __init__(self) -> None:
+        self.active: dict[int, Download] = {}
+        self.finished: deque[tuple[str, str, int]] = deque(maxlen=8)
+        self.probe = SizeProbe()
+        self.me = os.getpid()
+        self.steam = SteamTracker()
+
+    def scan(self, dt: float) -> None:
+        self.scan_processes(dt)
+        self.steam.scan(dt, self.active, self.finished)
+
+    def scan_processes(self, dt: float) -> None:
+        seen: set[int] = set()
+        for proc in psutil.process_iter(["pid", "name", "cmdline", "status"]):
+            info = proc.info
+            name = info["name"] or ""
+            if name not in DOWNLOADERS or info["pid"] == self.me or not info["cmdline"]:
+                continue
+            if info.get("status") == psutil.STATUS_ZOMBIE:
+                continue
+            seen.add(info["pid"])
+            d = self.active.get(info["pid"])
+            if d is None:
+                args = info["cmdline"][1:]
+                url_m = URL_RE.search(" ".join(args))
+                url = url_m.group(0) if url_m else None
+                path = None
+                if name in FILE_TOOLS:
+                    try:
+                        cwd = proc.cwd()
+                    except (psutil.AccessDenied, psutil.NoSuchProcess):
+                        cwd = None
+                    path = output_from_args(args, name, cwd)
+                d = Download(info["pid"], name, describe(name, args, url), url, path, time.monotonic())
+                self.active[info["pid"]] = d
+            # a path from the arguments may not exist yet; give it a few seconds before guessing from open files
+            if d.fd is None and d.tool in FILE_TOOLS and (
+                    d.path is None or (not os.path.isfile(d.path) and time.monotonic() - d.first_seen > 3)):
+                found = output_from_proc(proc)
+                if found:
+                    d.path, d.fd = found
+            d.update_size(dt)
+            if d.path and d.url and not d.total:
+                d.total = self.probe.get(d.url)
+        for pid in list(self.active):
+            if pid not in seen and pid > 0:
+                d = self.active.pop(pid)
+                if d.path:
+                    self.finished.appendleft((time.strftime("%H:%M:%S"), d.name, max(d.size, d.total)))
+
+
+def render_auto(tracker: Tracker, net: NetMeter, width: int) -> Group:
+    header = Table.grid(expand=True)
+    header.add_column(); header.add_column(justify="right")
+    header.add_row(
+        Text.assemble(("dlwatch", "bold"), ("  active downloads   ", "dim"),
+                      (f"↓ {human(net.rate)}/s", "cyan"), (f" on {net.iface}", "dim")),
+        Text(time.strftime("%H:%M:%S"), style="dim"))
+    parts: list = [header, Text()]
+
+    if not tracker.active:
+        parts.append(Text("  nothing downloading right now — watching…", style="dim"))
+    for d in sorted(tracker.active.values(), key=lambda x: x.name):
+        if d.path:
+            glyph = "♨ " if d.tool == "steam" else "▶ "
+            parts.append(Text.assemble((glyph, "bold"), (shorten(d.name, 48), "bold"), ("   " + d.tool, "dim"),
+                                       ((" · " + d.note) if d.note else "", "dim")))
+            row = Table.grid(padding=(0, 2))
+            row.add_column(width=36); row.add_column()
+            if d.total:
+                pct = min(100, d.size * 100 // d.total)
+                bar = ProgressBar(total=d.total, completed=d.size, width=34,
+                                  complete_style="green", finished_style="green", style="grey37")
+                stats = Text.assemble((f"{pct:3d}%", "bold"), f"  {human(d.size)} / {human(d.total)}   ",
+                                      (f"{human(d.rate)}/s", "cyan"), "   ", (f"ETA {eta(d.eta_seconds)}", "yellow"))
+            else:
+                bar = ProgressBar(total=None, pulse=True, width=34, pulse_style="green", style="grey37")
+                stats = Text.assemble(("size unknown", "dim"), f"  {human(d.size)} so far   ", (f"{human(d.rate)}/s", "cyan"))
+            row.add_row(bar, stats)
+            parts.append(row)
+            parts.append(Text("  → " + shorten(os.path.dirname(d.path), width - 6), style="dim"))
+        else:
+            age = int(time.monotonic() - d.first_seen)
+            parts.append(Text.assemble(("● ", "magenta"), (d.label[: width - 24], "magenta"),
+                                       (f"   {d.tool} · running {age}s", "dim")))
+        parts.append(Text())
+
+    if tracker.finished:
+        parts.append(Text("finished this session:", style="dim"))
+        for when, name, size in tracker.finished:
+            parts.append(Text.assemble(f"  {when}  ", ("✔", "green"), f" {shorten(name, 45)}  ", (human(size), "dim")))
+        parts.append(Text())
+    parts.append(Text("q quit", style="dim"))
+    return Group(*parts)
+
+
+def run_auto(console: Console) -> None:
+    tracker, net = Tracker(), NetMeter()
+    last = time.monotonic()
+    with Keys() as keys, Live(console=console, screen=True, auto_refresh=False) as live:
+        while True:
+            now = time.monotonic()
+            dt = max(0.2, now - last); last = now
+            net.tick(dt)
+            tracker.scan(dt)
+            live.update(render_auto(tracker, net, console.width), refresh=True)
+            if wait_or_quit(keys, 1.0):
+                break
+    if tracker.finished:
+        console.print("[dim]finished while watching:[/dim]")
+        for when, name, size in tracker.finished:
+            console.print(f"  {when}  [green]✔[/green] {name}  [dim]{human(size)}[/dim]")
+
+
+# --------------------------------------------------------------------------- folder mode
+
+def folder_stats(folder: Path, pattern: str) -> tuple[int, int]:
+    files = [p for p in folder.glob(pattern) if p.is_file()]
+    return len(files), sum(p.stat().st_size for p in files)
+
+
+def run_folder(console: Console, folder: Path, total_text: str | None, pattern: str, logfile: str | None) -> None:
+    if not folder.is_dir():
+        sys.exit(f"dlwatch: not a directory: {folder}")
+    mode, total = parse_total(total_text)
+    net = NetMeter()
+    start = time.monotonic()
+    count, size = folder_stats(folder, pattern)
+    start_size, prev_size, last = size, size, start
+
+    with Keys() as keys, Live(console=console, screen=True, auto_refresh=False) as live:
+        while True:
+            now = time.monotonic(); dt = max(0.2, now - last); last = now
+            net.tick(dt)
+            count, size = folder_stats(folder, pattern)
+            grow = max(0, size - prev_size) / dt; prev_size = size
+            elapsed = now - start
+
+            parts: list = [Text.assemble(("dlwatch", "bold"), ("  folder  ", "dim"),
+                                         shorten(str(folder), console.width - 40), "   ",
+                                         (f"↓ {human(net.rate)}/s", "cyan")), Text()]
+            if mode == "count":
+                pct = min(100, count * 100 // total) if total else 0
+                parts.append(ProgressBar(total=total, completed=min(count, total), width=40, complete_style="green", style="grey37"))
+                parts.append(Text.assemble((f"  {pct}%", "bold"), f"   {count} / {total} files"))
+            elif mode == "bytes":
+                pct = min(100, size * 100 // total) if total else 0
+                avg = (size - start_size) / elapsed if elapsed > 3 else 0
+                parts.append(ProgressBar(total=total, completed=min(size, total), width=40, complete_style="green", style="grey37"))
+                parts.append(Text.assemble((f"  {pct}%", "bold"), f"   {human(size)} / {human(total)}   ",
+                                           (f"ETA {eta((total - size) / avg if avg > 0 else None)}", "yellow")))
+            else:
+                parts.append(Text.assemble((str(count), "bold"), " files   ", (human(size), "bold")))
+            parts.append(Text.assemble("folder growing at ", (f"{human(grow)}/s", "green")))
+            if logfile and os.path.isfile(logfile):
+                try:
+                    with open(logfile, "rb") as fh:
+                        fh.seek(0, 2); fh.seek(max(0, fh.tell() - 4096))
+                        tail = fh.read().decode(errors="replace").rstrip("\n").splitlines()
+                    parts.extend([Text(), Text.assemble(("log: ", "dim"), (tail[-1] if tail else "")[: console.width - 6])])
+                except OSError:
+                    pass
+            parts.extend([Text(), Text(f"elapsed {int(elapsed) // 60}m{int(elapsed) % 60:02d}s · q quit", style="dim")])
+            live.update(Group(*parts), refresh=True)
+            if wait_or_quit(keys, 1.0):
+                break
+
+
+# --------------------------------------------------------------------------- main
+
+def relaunch_in_window(argv: list[str]) -> None:
+    me = os.path.abspath(__file__)
+    for term, pre in (("konsole", ["konsole", "--title", "dlwatch", "-e"]), ("gnome-terminal", ["gnome-terminal", "--"]),
+                      ("ptyxis", ["ptyxis", "--"]), ("xterm", ["xterm", "-T", "dlwatch", "-e"])):
+        if shutil.which(term):
+            subprocess.Popen(pre + [me] + argv, start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return
+    sys.exit("dlwatch: no terminal emulator found")
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(prog="dlwatch", description=__doc__.split("\n\n")[0],
+                                 formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__.split("\n", 2)[2])
+    ap.add_argument("dir", nargs="?", help="folder mode: folder to watch")
+    ap.add_argument("total", nargs="?", help="folder mode: expected file count (93) or size (4.7G)")
+    ap.add_argument("-p", "--pattern", default="*", help="folder mode: only count files matching this glob")
+    ap.add_argument("-l", "--log", help="folder mode: show the last line of this log file")
+    ap.add_argument("-w", "--window", action="store_true", help="open in a new terminal window")
+    a = ap.parse_args()
+
+    if a.window:
+        relaunch_in_window([x for x in sys.argv[1:] if x not in ("-w", "--window")])
+        return
+    console = Console()
+    try:
+        if a.dir:
+            run_folder(console, Path(a.dir).expanduser(), a.total, a.pattern, a.log)
+        else:
+            run_auto(console)
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()

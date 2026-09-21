@@ -1,0 +1,6 @@
+#!/usr/bin/env python3
+"""cmdmon — show a shell command's output on an interval:  cmdmon --set command='journalctl -n 20' -i 5"""
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from mon.core import run_standalone
+run_standalone("cmd")

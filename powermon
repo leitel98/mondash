@@ -1,0 +1,6 @@
+#!/usr/bin/env python3
+"""powermon — standalone 'power' monitor from the mon toolkit. Try --options, -w opens a window."""
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from mon.core import run_standalone
+run_standalone("power")

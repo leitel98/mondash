@@ -1,0 +1,3 @@
+rich>=13
+psutil>=5.9
+pillow>=9        # optional: GIF playback in the animation panel
