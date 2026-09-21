@@ -380,6 +380,16 @@ class Dashboard:
         return RichPanel(t, title="help — press any key", box=th.rich_box(), border_style=th.focus, width=width, height=height)
 
     # keys --------------------------------------------------------------------
+    @staticmethod
+    def _safe(panel: Panel, method: str, *args) -> bool:
+        """Call a panel's input handler; a panel bug becomes an error line in that panel, not a crash."""
+        try:
+            return bool(getattr(panel, method)(*args))
+        except Exception as exc:
+            panel._error = f"{method}: {exc!r}"
+            panel.version += 1
+            return True
+
     def on_mouse(self, kind: str, x: int, y: int) -> bool:
         """x/y are 0-based screen cells."""
         for name, rx, ry, rw, rh in self.last_rects:
@@ -394,7 +404,7 @@ class Dashboard:
                             self.zoom = not self.zoom
                         return True
                 p = self.panels[name]
-                if p.on_mouse(kind, x - rx - 1, y - ry - 1):
+                if self._safe(p, "on_mouse", kind, x - rx - 1, y - ry - 1):
                     p.version += 1
                 if p.wants_hide:
                     p.wants_hide = False
@@ -420,19 +430,19 @@ class Dashboard:
             if key in ("ESC", "q") or (key in ("ENTER", "f")):
                 self.toggle_overlay(self.overlay)
                 return True
-            if p and p.on_key(key):
+            if p and self._safe(p, "on_key", key):
                 p.version += 1
                 return True
             return False
         focused = self.panels[self.order[self.focus]] if self.order else None
         # a panel in text-entry mode (proc filter) gets everything first
         if focused and (getattr(focused, "typing", False) or getattr(focused, "pending_kill", None)):
-            if focused.on_key(key):
+            if self._safe(focused, "on_key", key):
                 focused.version += 1
                 return True
             return False
         if key == "ENTER" and focused and focused.takes_enter and self.order[self.focus] not in self.hidden:
-            if focused.on_key(key):
+            if self._safe(focused, "on_key", key):
                 focused.version += 1
                 return True
         if key in ("TAB", "BTAB"):
@@ -473,7 +483,7 @@ class Dashboard:
         elif key == "ESC" and self.zoom:
             self.zoom = False
         elif focused:
-            handled = focused.on_key(key)
+            handled = self._safe(focused, "on_key", key)
             if handled:
                 focused.version += 1
             if focused.wants_hide:
