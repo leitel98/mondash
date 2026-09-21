@@ -145,8 +145,12 @@ class GifPanel(Panel):
             return False
         for x0, x1, action in self._buttons:
             if self._button_row == y and x0 <= x < x1:
-                {"back": self.back, "pause": lambda: setattr(self, "playing", not self.playing),
-                 "hide": lambda: setattr(self, "wants_hide", True), "rescan": self.rescan}[action]()
+                actions = {"back": self.back, "pause": lambda: setattr(self, "playing", not self.playing),
+                           "play": lambda: self.play(self.items[self.sel][1]) if self.items else None,
+                           "hide": lambda: setattr(self, "wants_hide", True), "rescan": self.rescan}
+                fn = actions.get(action)
+                if fn:
+                    fn()
                 return True
         if self.mode == "browse":
             n = self.top + y - self._list_top
