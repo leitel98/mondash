@@ -701,7 +701,7 @@ interval = 1.0
 # sections = ["system", "cpu", "memory", "gpu", "storage", "network", "audio", "display", "battery", "os"]
 
 [panels.gif]
-folder = "~/.config/mon/gifs"          # drop .gif files here; the panel lists them (plus built-in effects)
+# folder = "~/Pictures/gifs"           # default: the gifs/ folder next to mondash; the panel lists it (plus built-in effects)
 # file = "plasma"                      # start playing this gif path or effect instead of showing the list
 fps = 8
 hidden = false                         # start hidden; `g` or the panel's ✕ button toggles it

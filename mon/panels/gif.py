@@ -17,7 +17,7 @@ from rich.console import Group
 from rich.style import Style
 from rich.text import Text
 
-from ..core import CONFIG_DIR, Panel, fit, tilde
+from ..core import SCRIPTS_DIR, Panel, fit, tilde
 
 try:
     from PIL import Image, ImageSequence
@@ -26,7 +26,7 @@ except Exception:                  # Pillow missing: built-in effects still work
 
 BUILTINS = ["plasma", "rain", "donut", "wave"]
 _PLASMA_STYLES: dict = {}
-DEFAULT_FOLDER = CONFIG_DIR / "gifs"
+DEFAULT_FOLDER = SCRIPTS_DIR / "gifs"          # the repo's own gifs/ folder
 
 
 class GifPanel(Panel):

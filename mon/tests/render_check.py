@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Headless regression check: sample every panel, render each at several sizes, compose every layout at 3 terminal sizes.
 
-Run:  python3 -m mon.tests.render_check   (from ~/Projects/scripts). Prints 'errors: none' when all is well.
+Run:  python3 -m mon.tests.render_check   (from the repo folder). Prints 'errors: none' when all is well.
 """
 import os
 import sys

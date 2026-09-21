@@ -12,30 +12,16 @@ any shell command, and an animation panel for GIFs.
 ## Install
 
 ```
-git clone https://github.com/leitel98/mondash.git ~/Projects/scripts   # or anywhere
+git clone https://github.com/leitel98/mondash.git ~/Projects/mondash
 pip install --user rich psutil pillow
-cd ~/Projects/scripts && ./mondash                                      # config appears at ~/.config/mon/dash.toml
+~/Projects/mondash/install.sh        # symlinks the launchers into ~/.local/bin, adds desktop entries
+mondash                              # config appears at ~/.config/mon/dash.toml on first run
 ```
 
-Add the folder to your `PATH` to run `mondash`, `cpumon`, `procmon`, `dlwatch`, … from anywhere.
-Requires Python 3.11+ and a terminal with true colour and mouse support (Konsole, kitty, foot,
-Alacritty, GNOME Terminal, …).
-
-Every monitor is a small python module in `mon/panels/`. Each one runs on its own
-(`cpumon`, `memmon`, `netmon`, `diskmon`, `procmon`, `gpumon`, `tempmon`, `powermon`,
-`sysmon`, `dlmon`, `cmdmon`) or as a brick inside `mondash`.
-
-```
-mondash                  # dashboard, layout from ~/.config/mon/dash.toml (created on first run)
-mondash -l gaming        # start on a named layout
-mondash -w               # in its own terminal window
-mondash --panels         # list panel types and their options
-mondash -l info          # hardware inventory + animation layout
-python3 -m mon.tests.render_check   # headless regression check of every panel and layout
-cpumon                   # any panel alone; -i 0.5 interval, -b no frame, -w window
-netmon --set iface=enp7s0f1
-cmdmon --set command='journalctl -f -n 20 --no-pager' -i 3
-```
+Everything lives in the cloned folder: the `mon` package, the launchers, `dlwatch`, and a `gifs/`
+folder the animation panel lists by default (drop your own `.gif` files there). Requires Python
+3.11+ and a terminal with true colour and mouse support (Konsole, kitty, foot, Alacritty, GNOME
+Terminal, …). `./install.sh --uninstall` removes the links again.
 
 ## Mouse
 
