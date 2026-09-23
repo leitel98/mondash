@@ -153,19 +153,26 @@ def wait_or_quit(keys: Keys, seconds: float) -> bool:
 class SizeProbe:
     """Asks each URL once for Content-Length, in the background."""
 
+    RETRY_AFTER = 30.0          # a failed probe (0) is retried after this many seconds
+
     def __init__(self) -> None:
         self.pool = ThreadPoolExecutor(max_workers=4)
         self.results: dict[str, int] = {}
+        self.failed_at: dict[str, float] = {}
         self.pending: dict[str, object] = {}
 
     def get(self, url: str) -> int:
         if url in self.results:
-            return self.results[url]
+            if self.results[url] or time.monotonic() - self.failed_at.get(url, 0) < self.RETRY_AFTER:
+                return self.results[url]
+            del self.results[url]                        # stale failure: probe again
         fut = self.pending.get(url)
         if fut is None:
             self.pending[url] = self.pool.submit(self._head, url)
         elif fut.done():
             self.results[url] = fut.result()
+            if not self.results[url]:
+                self.failed_at[url] = time.monotonic()
             del self.pending[url]
             return self.results[url]
         return 0
@@ -174,8 +181,20 @@ class SizeProbe:
     def _head(url: str) -> int:
         try:
             import requests
-            r = requests.head(url, allow_redirects=True, timeout=12,
-                              headers={"User-Agent": "dlwatch-probe"})
+            headers = {"User-Agent": "dlwatch-probe"}
+            r = requests.head(url, allow_redirects=True, timeout=12, headers=headers)
+            if r.status_code == 401 and "bearer" in r.headers.get("WWW-Authenticate", "").lower():
+                # OCI registry (Homebrew bottles on ghcr.io etc.): fetch an anonymous pull token and retry
+                fields = dict(re.findall(r'(\w+)="([^"]*)"', r.headers["WWW-Authenticate"]))
+                if fields.get("realm"):
+                    tok = requests.get(fields["realm"], params={k: v for k, v in fields.items() if k in ("service", "scope")},
+                                       timeout=12, headers=headers)
+                    token = tok.json().get("token") or tok.json().get("access_token") if tok.ok else None
+                    if token:
+                        headers["Authorization"] = f"Bearer {token}"
+                        r = requests.head(url, allow_redirects=True, timeout=12, headers=headers)
+            if r.status_code >= 400:              # error bodies are tiny JSON, not the file
+                return 0
             return int(r.headers.get("Content-Length", 0))
         except Exception:
             return 0
@@ -205,6 +224,25 @@ class Download:
         if self.tool == "steam":
             return self.label
         return os.path.basename(self.path) if self.path else self.label
+
+    @property
+    def display_name(self) -> str:
+        """Human name: drops Homebrew's sha256-- prefix and partial-file suffixes."""
+        n = self.name
+        m = re.match(r"^[0-9a-f]{40,64}--(.+)$", n)
+        if m:
+            n = m.group(1)
+        for suf in (".incomplete", ".part", ".crdownload", ".download", ".partial", ".tmp"):
+            if n.endswith(suf) and len(n) > len(suf):
+                n = n[: -len(suf)]
+        m = re.match(r"^(.+?)--(.+?)\.[a-z0-9_]+_(?:linux|darwin|sonoma|sequoia|ventura|monterey)\.bottle(?:\.\d+)?\.tar\.gz$", n)
+        if m:
+            n = f"{m.group(1)} {m.group(2)} (bottle)"
+        return n
+
+    @property
+    def pct(self) -> int:
+        return min(100, self.size * 100 // self.total) if self.total else 0
 
     def push_size(self, size: int, dt: float) -> None:
         """Feed a size observed elsewhere (not from a file) into the smoothed rate."""
@@ -295,8 +333,12 @@ def output_from_proc(proc: psutil.Process) -> tuple[str, int | None] | None:
 def describe(tool: str, args: list[str], url: str | None) -> str:
     cmd = " ".join(args)
     if tool == "flatpak":
-        m = APPID_RE.search(cmd)
-        return f"flatpak {m.group(0) if m else cmd[8:60]}"
+        verbs = [a for a in args if a in ("install", "update", "upgrade", "remote-ls", "run", "repair", "uninstall")]
+        verb = verbs[0] if verbs else ""
+        m = APPID_RE.search(" ".join(a for a in args if not a.startswith("-")))
+        if m:
+            return f"flatpak {verb} {m.group(0)}".replace("  ", " ")
+        return f"flatpak {verb or 'update'}" + (" (all apps)" if verb in ("", "update", "upgrade") else "")
     if tool in ("rsync", "scp"):
         return f"{tool} → {args[-1] if args else ''}"
     if tool.startswith("git"):
@@ -469,6 +511,15 @@ class SteamTracker:
 
 
 class Tracker:
+    def apply_total(self, d: "Download") -> None:
+        """Probe the URL for a total; drop totals the file has already outgrown (redirect/error bodies)."""
+        if d.path and d.url and not d.total:
+            d.total = self.probe.get(d.url)
+        if d.total and d.size > d.total:
+            d.total = 0
+            if d.url:
+                self.probe.results[d.url] = 0
+
     def __init__(self) -> None:
         self.active: dict[int, Download] = {}
         self.finished: deque[tuple[str, str, int]] = deque(maxlen=8)
@@ -511,13 +562,12 @@ class Tracker:
                 if found:
                     d.path, d.fd = found
             d.update_size(dt)
-            if d.path and d.url and not d.total:
-                d.total = self.probe.get(d.url)
+            self.apply_total(d)
         for pid in list(self.active):
             if pid not in seen and pid > 0:
                 d = self.active.pop(pid)
                 if d.path:
-                    self.finished.appendleft((time.strftime("%H:%M:%S"), d.name, max(d.size, d.total)))
+                    self.finished.appendleft((time.strftime("%H:%M:%S"), d.display_name, max(d.size, d.total)))
 
 
 def render_auto(tracker: Tracker, net: NetMeter, width: int) -> Group:
@@ -534,12 +584,12 @@ def render_auto(tracker: Tracker, net: NetMeter, width: int) -> Group:
     for d in sorted(tracker.active.values(), key=lambda x: x.name):
         if d.path:
             glyph = "♨ " if d.tool == "steam" else "▶ "
-            parts.append(Text.assemble((glyph, "bold"), (shorten(d.name, 48), "bold"), ("   " + d.tool, "dim"),
+            parts.append(Text.assemble((glyph, "bold"), (shorten(d.display_name, 48), "bold"), ("   " + d.tool, "dim"),
                                        ((" · " + d.note) if d.note else "", "dim")))
             row = Table.grid(padding=(0, 2))
             row.add_column(width=36); row.add_column()
             if d.total:
-                pct = min(100, d.size * 100 // d.total)
+                pct = d.pct
                 bar = ProgressBar(total=d.total, completed=d.size, width=34,
                                   complete_style="green", finished_style="green", style="grey37")
                 stats = Text.assemble((f"{pct:3d}%", "bold"), f"  {human(d.size)} / {human(d.total)}   ",

@@ -66,15 +66,14 @@ def make_fast_tracker(dlw):
                         if found:
                             d.path, d.fd = found
                     d.update_size(dt)
-                    if d.path and d.url and not d.total:
-                        d.total = self.probe.get(d.url)
+                    self.apply_total(d)
                 except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
                     continue
             for pid in list(self.active):
                 if pid not in seen and pid > 0:
                     d = self.active.pop(pid)
                     if d.path:
-                        self.finished.appendleft((time.strftime("%H:%M:%S"), d.name, max(d.size, d.total)))
+                        self.finished.appendleft((time.strftime("%H:%M:%S"), d.display_name, max(d.size, d.total)))
 
     return FastTracker
 
@@ -110,34 +109,84 @@ class DlPanel(Panel):
         if not self.dlw:
             return Text(f"dlwatch unavailable: {self.err}", style=th.bad)
         rows: list = []
-        active = sorted(self.tracker.active.values(), key=lambda d: d.name)
+        # known-size downloads first (they have bars), then unknown size, then process-only entries; fastest first
+        active = sorted(self.tracker.active.values(),
+                        key=lambda d: (0 if d.total else 1 if d.path else 2, -d.rate, d.display_name.lower()))
         if not active:
             rows.append(Text("nothing downloading — watching…", style=th.dim))
-        for d in active:
-            if len(rows) + 2 > height:
-                rows.append(Text(f"… +{len(active) - len(rows) // 2} more", style=th.dim))
-                break
-            if d.path:
-                glyph = "♨ " if d.tool == "steam" else "▶ "
-                note = getattr(d, "note", "")
-                rows.append(Text.assemble((glyph, "bold"), (fit(d.name, width - 14 - len(note)), "bold"), ("  " + d.tool, th.dim),
-                                          ((" · " + note) if note else "", th.dim)))
-                if d.total:
-                    pct = min(100, d.size * 100 // d.total)
-                    stats = Text.assemble((f"{pct:3d}%", "bold"), f" {human(d.size)}/{human(d.total)} ",
-                                          (rate(d.rate), th.accent), " ", (f"ETA {self.dlw.eta(d.eta_seconds)}", th.warn))
-                    if width >= 20 and height - len(rows) > 3:       # room for a bar line above the stats
-                        rows.append(bar(d.size / d.total, width, th, palette=[th.good, th.good, th.accent]))
-                    rows.append(stats)
-                else:
-                    rows.append(Text.assemble(("size unknown", th.dim), f"  {human(d.size)} so far  ", (rate(d.rate), th.accent)))
-                if height - len(rows) > len(active) + 1:
-                    rows.append(Text("  → " + fit(tilde(os.path.dirname(d.path)), width - 4, tail=True), style=th.dim))
-            else:
-                age = int(time.monotonic() - d.first_seen)
-                rows.append(Text.assemble(("● ", "magenta"), (fit(d.label, width - 20), "magenta"), (f"  {d.tool} · {age}s", th.dim)))
+        n = len(active)
+        fin_rows = min(len(self.tracker.finished), 3) + 1 if self.tracker.finished else 0
+        avail = max(1, height - (fin_rows if n * 1 + fin_rows <= height else 0))
+        per = 3 if n * 3 <= avail else 2 if n * 2 <= avail else 1
+        shown = active if per > 1 or n <= avail else active[: max(0, avail - 1)]
+        stats_w = max((len(self._stats(d).plain) for d in shown if d.path), default=0)
+        for d in shown:
+            rows.extend(self._entry(d, width, per, stats_w))
+        if len(shown) < n:
+            rows.append(Text(f"… +{n - len(shown)} more", style=th.dim))
         if self.tracker.finished and len(rows) < height - 1:
             rows.append(Text("finished:", style=th.dim))
             for when, name, size in list(self.tracker.finished)[: height - len(rows)]:
                 rows.append(Text.assemble((f"{when} ", th.dim), ("✔ ", th.good), fit(name, width - 18), (f" {human(size)}", th.dim)))
-        return Group(*rows)
+        return Group(*rows[:height])
+
+    def _stats(self, d) -> Text:
+        th = self.theme
+        stats = Text(no_wrap=True)
+        if d.total:
+            stats.append(f"{d.pct:3d}%", "bold")
+            stats.append(f" {human(d.size)}/{human(d.total)} ")
+            stats.append(rate(d.rate), th.accent)
+            stats.append(" ")
+            stats.append(f"ETA {self.dlw.eta(d.eta_seconds)}", th.warn)
+        else:
+            stats.append("size unknown ", th.dim)
+            stats.append(f"{human(d.size)} so far ")
+            stats.append(rate(d.rate), th.accent)
+        return stats
+
+    def _entry(self, d, width: int, per: int, stats_w: int = 0) -> list:
+        """1, 2 or 3 lines for one download depending on how crowded the panel is."""
+        th = self.theme
+        glyph = "♨ " if d.tool == "steam" else "▶ " if d.path else "● "
+        note = getattr(d, "note", "")
+        name_style = "bold" if d.path else "magenta"
+        if not d.path:                                                   # process only (flatpak, git, pip…)
+            age = int(time.monotonic() - d.first_seen)
+            line = Text.assemble((glyph, "magenta"), (fit(d.label, width - 20), "magenta"), (f"  {d.tool} · {age}s", th.dim))
+            return [line] + ([Text("")] if per == 3 else [])
+        stats = self._stats(d)
+        if per == 1:
+            bar_w = max(0, min(20, width // 4))
+            name_w = max(8, width - bar_w - max(stats_w, len(stats.plain)) - 4)
+            line = Text.assemble((glyph, name_style), (fit(d.display_name, name_w).ljust(name_w), name_style), " ")
+            if bar_w >= 4:
+                if d.total:
+                    line.append_text(bar(d.size / d.total, bar_w, th, palette=[th.good, th.good, th.accent]))
+                else:
+                    line.append(th.bar_empty * bar_w, th.bar_empty_style)
+                line.append(" ")
+            line.append_text(stats)
+            return [line]
+        head = Text.assemble((glyph, name_style), (fit(d.display_name, width - 6 - len(d.tool) - (len(note) + 3 if note else 0)), name_style),
+                             ("  " + d.tool, th.dim), ((" · " + note) if note else "", th.dim))
+        if per == 2:
+            bar_w = max(0, width - len(stats.plain) - 1)
+            line = Text(no_wrap=True)
+            if d.total and bar_w >= 6:
+                line.append_text(bar(d.size / d.total, bar_w, th, palette=[th.good, th.good, th.accent]))
+                line.append(" ")
+            line.append_text(stats)
+            return [head, line]
+        out = [head]
+        if d.total:
+            out.append(bar(d.size / d.total, width, th, palette=[th.good, th.good, th.accent]))
+        else:
+            out.append(Text(th.bar_empty * width, style=th.bar_empty_style))
+        tail = Text(no_wrap=True)
+        tail.append_text(stats)
+        dest = "  → " + tilde(os.path.dirname(d.path))
+        if len(tail.plain) + len(dest) <= width:
+            tail.append(dest, th.dim)
+        out.append(tail)
+        return out
