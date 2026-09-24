@@ -45,6 +45,7 @@ class ProcPanel(Panel):
         self._cols: list[tuple[int, int, str | None]] = []       # x0, x1, sort key — filled during render for mouse
         self._body_h = 1
         self._filt_row = 1          # 1 when the filter input box is drawn above the header (0 on tiny panels)
+        self._sel_reset = False     # filter text changed: next sample selects the first match instead of following the pid
         self._detail_cache: tuple[int, float, list[Text]] | None = None
         try:
             self.me = psutil.Process().username()
@@ -70,7 +71,10 @@ class ProcPanel(Panel):
         rows.sort(key=key)
         sel_pid = self.rows[self.sel]["pid"] if self.rows and self.sel < len(self.rows) else None
         self.rows, self.total, self.threads = rows, total, threads
-        if sel_pid is not None:
+        if self._sel_reset:
+            self._sel_reset = False
+            self.sel = self.top = 0
+        elif sel_pid is not None:
             for n, r in enumerate(rows):
                 if r["pid"] == sel_pid:
                     self.sel = n
@@ -99,15 +103,22 @@ class ProcPanel(Panel):
         self._resample()
 
     def on_key(self, key: str) -> bool:
-        if self.typing:
+        if self.typing and not self.pending_kill:
             if key in ("ENTER", "ESC"):
                 self.typing = False
                 if key == "ESC":
                     self.filter = ""
+            elif key in ("UP", "DOWN", "PGUP", "PGDN", "HOME", "END"):
+                self.typing = False                      # keep the filter, move on to the list
+                return self.on_key(key)
             elif key == "BACKSPACE":
                 self.filter = self.filter[:-1]
+                self._sel_reset = True
             elif len(key) == 1 and key.isprintable():
                 self.filter += key
+                self._sel_reset = True
+            else:
+                return True
             self._resample()
             return True
         if self.pending_kill:
@@ -176,11 +187,13 @@ class ProcPanel(Panel):
             if y == 0 and off:                           # filter box → start typing
                 self.typing = True
             elif y == off:                               # header → sort
+                self.typing = False
                 for x0, x1, key in self._cols:
                     if key and x0 <= x < x1:
                         self._set_sort(key)
                         break
             elif off + 1 <= y <= off + self._body_h:
+                self.typing = False                      # keep the filter, act on the clicked row
                 n = self.top + y - off - 1
                 if n < len(self.rows):
                     if n == self.sel and kind == "CLICK":
