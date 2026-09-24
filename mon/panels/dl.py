@@ -1,4 +1,5 @@
-"""Downloads: wraps the existing dlwatch tracker as a panel (curl, wget, aria2c, flatpak, rsync, git, scp, pip)."""
+"""Downloads: wraps the existing dlwatch tracker as a panel (curl, wget, aria2c, flatpak, rsync, git, scp, pip,
+yarn/npm/pnpm/bun installs, go mod download, Android sdkmanager, gradle, podman/docker pull, Steam)."""
 from __future__ import annotations
 
 import importlib.util
@@ -30,34 +31,47 @@ def make_fast_tracker(dlw):
     """Subclass dlwatch.Tracker whose scan() finds downloader processes via the shared /proc snapshot."""
     import psutil
 
-    comm_map = {name[:15]: name for name in dlw.DOWNLOADERS}       # /proc comm is truncated to 15 chars
+    comm_map = {name[:15]: name for name in dlw.DOWNLOADERS | dlw.CMDLINE_TOOLS}   # /proc comm is truncated to 15 chars
 
     class FastTracker(dlw.Tracker):
+        def __init__(self) -> None:
+            super().__init__()
+            self.kinds: dict[int, tuple | None] = {}      # pid -> classify() result, so a runtime's cmdline is read once
+
         def scan_processes(self, dt: float) -> None:
             snap = SCANNER.snapshot(0.5)
             seen: set[int] = set()
             for row in snap.rows:
-                tool = comm_map.get(row["name"])
-                if not tool or row["pid"] == self.me or row["kernel"] or row["st"] == "Z":
+                comm = comm_map.get(row["name"])
+                if not comm or row["pid"] == self.me or row["kernel"] or row["st"] == "Z":
                     continue
                 pid = row["pid"]
                 try:
                     proc = psutil.Process(pid)
                     d = self.active.get(pid)
                     if d is None:
-                        args = proc.cmdline()[1:]
-                        if not args and tool not in ("flatpak",):
+                        if pid in self.kinds:
+                            kind = self.kinds[pid]
+                        else:
+                            args = proc.cmdline()[1:]
+                            cwd = None
+                            if comm in dlw.CMDLINE_TOOLS or comm in dlw.FILE_TOOLS:
+                                try:
+                                    cwd = proc.cwd()
+                                except (psutil.AccessDenied, psutil.NoSuchProcess):
+                                    cwd = None
+                            kind = dlw.classify(comm, args, cwd) if (args or comm == "flatpak") else None
+                            if kind is not None:
+                                kind = (*kind, args, cwd)
+                            self.kinds[pid] = kind
+                        if kind is None:
+                            seen.add(pid)                       # keep the negative answer cached while it lives
                             continue
+                        tool, label, staging, args, cwd = kind
                         url_m = dlw.URL_RE.search(" ".join(args))
                         url = url_m.group(0) if url_m else None
-                        path = None
-                        if tool in dlw.FILE_TOOLS:
-                            try:
-                                cwd = proc.cwd()
-                            except (psutil.AccessDenied, psutil.NoSuchProcess):
-                                cwd = None
-                            path = dlw.output_from_args(args, tool, cwd)
-                        d = dlw.Download(pid, tool, dlw.describe(tool, args, url), url, path, time.monotonic())
+                        path = dlw.output_from_args(args, tool, cwd) if tool in dlw.FILE_TOOLS else None
+                        d = dlw.Download(pid, tool, label, url, path, time.monotonic(), staging=staging)
                         self.active[pid] = d
                     seen.add(pid)
                     if d.fd is None and d.tool in dlw.FILE_TOOLS and (
@@ -65,15 +79,16 @@ def make_fast_tracker(dlw):
                         found = dlw.output_from_proc(proc)
                         if found:
                             d.path, d.fd = found
-                    d.update_size(dt)
+                    self.measure(d, dt)
                     self.apply_total(d)
                 except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
                     continue
             for pid in list(self.active):
                 if pid not in seen and pid > 0:
-                    d = self.active.pop(pid)
-                    if d.path:
-                        self.finished.appendleft((time.strftime("%H:%M:%S"), d.display_name, max(d.size, d.total)))
+                    self.retire(self.active.pop(pid))
+            for pid in list(self.kinds):
+                if pid not in seen:
+                    del self.kinds[pid]
 
     return FastTracker
 
@@ -119,7 +134,7 @@ class DlPanel(Panel):
         avail = max(1, height - (fin_rows if n * 1 + fin_rows <= height else 0))
         per = 3 if n * 3 <= avail else 2 if n * 2 <= avail else 1
         shown = active if per > 1 or n <= avail else active[: max(0, avail - 1)]
-        stats_w = max((len(self._stats(d).plain) for d in shown if d.path), default=0)
+        stats_w = max((len(self._stats(d).plain) for d in shown if d.path or (d.samples and d.size > 0)), default=0)
         for d in shown:
             rows.extend(self._entry(d, width, per, stats_w))
         if len(shown) < n:
@@ -140,7 +155,7 @@ class DlPanel(Panel):
             stats.append(" ")
             stats.append(f"ETA {self.dlw.eta(d.eta_seconds)}", th.warn)
         else:
-            stats.append("size unknown ", th.dim)
+            stats.append("size unknown " if d.path else "≈ " if d.approx else "", th.dim)
             stats.append(f"{human(d.size)} so far ")
             stats.append(rate(d.rate), th.accent)
         return stats
@@ -151,10 +166,16 @@ class DlPanel(Panel):
         glyph = "♨ " if d.tool == "steam" else "▶ " if d.path else "● "
         note = getattr(d, "note", "")
         name_style = "bold" if d.path else "magenta"
-        if not d.path:                                                   # process only (flatpak, git, pip…)
+        if not d.path:                                                   # process only (flatpak, yarn, sdkmanager…)
             age = int(time.monotonic() - d.first_seen)
+            measured = self._stats(d) if d.samples and d.size > 0 else None
+            if per == 1 and measured is not None:
+                name_w = max(8, width - len(measured.plain) - 4)
+                return [Text.assemble((glyph, "magenta"), (fit(d.label, name_w).ljust(name_w), "magenta"), " ", measured)]
             line = Text.assemble((glyph, "magenta"), (fit(d.label, width - 20), "magenta"), (f"  {d.tool} · {age}s", th.dim))
-            return [line] + ([Text("")] if per == 3 else [])
+            if measured is None:
+                return [line] + ([Text("")] if per == 3 else [])
+            return [line, measured] + ([Text("")] if per == 3 else [])
         stats = self._stats(d)
         if per == 1:
             bar_w = max(0, min(20, width // 4))

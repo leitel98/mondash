@@ -3,7 +3,9 @@
 
 Usage:
   dlwatch                 auto mode: finds every download in progress (curl, wget,
-                          aria2c, flatpak, rsync, git, scp, pip, Steam) and shows a live bar
+                          aria2c, flatpak, rsync, git, scp, pip, Steam, plus yarn/npm/pnpm/bun
+                          installs, go mod download, Android sdkmanager, gradle, podman/docker
+                          pull) and shows a live bar
   dlwatch -w              same, in its own terminal window
   dlwatch DIR [TOTAL]     folder mode: watch a folder fill up. TOTAL is a file count
                           (93) or a size (4.7G). Options: -p '*.zip'  -l file.log
@@ -41,6 +43,10 @@ from rich.text import Text
 
 DOWNLOADERS = {"curl", "wget", "aria2c", "rsync", "flatpak", "git", "git-remote-https", "scp", "pip", "pip3"}
 FILE_TOOLS = {"curl", "wget", "aria2c"}           # tools where one output file can be tracked
+# Runtimes whose process name says nothing: the tool is recognised from the command line instead
+# (yarn/npm/pnpm under node, sdkmanager/gradle under java, go mod download, podman/docker pull).
+CMDLINE_TOOLS = {"node", "java", "go", "podman", "docker", "bun"}
+PKG_VERBS = {"install", "i", "ci", "add", "update", "up", "upgrade", "install-test", "it"}
 URL_RE = re.compile(r"(?:https?|ftp)://[^\s\"']+")
 APPID_RE = re.compile(r"[A-Za-z0-9_]+(?:\.[A-Za-z0-9_-]+){2,}")
 SKIP_PREFIX = ("/dev/", "/proc/", "/sys/", "/run/")
@@ -218,6 +224,9 @@ class Download:
     last_walk: float = 0.0
     history: deque = field(default_factory=lambda: deque(maxlen=64))
     reported: str = ""
+    staging: str | None = None           # directory whose growth is the download (sdkmanager .temp)
+    approx: bool = False                 # size comes from the process read counter, not a file
+    io_base: int = -1
 
     @property
     def name(self) -> str:
@@ -328,6 +337,114 @@ def output_from_proc(proc: psutil.Process) -> tuple[str, int | None] | None:
             if os.path.isfile(p):                   # invisible from here (other namespace)
                 return p, None
     return None
+
+
+def _positional(args: list[str]) -> list[str]:
+    return [a for a in args if not a.startswith("-")]
+
+
+def classify(comm: str, args: list[str], cwd: str | None = None) -> tuple[str, str, str | None] | None:
+    """(tool, label, staging_dir) when this process is downloading, else None.
+
+    comm is the /proc name (15 chars), args the command line without argv[0]. Tools in DOWNLOADERS
+    match on the name alone; CMDLINE_TOOLS are runtimes, so the verb decides (a dev server run by
+    yarn is not a download, `yarn install` is). staging_dir, when known, is a small directory whose
+    growth is the download; otherwise progress comes from the process's read counter."""
+    if comm in DOWNLOADERS:
+        url_m = URL_RE.search(" ".join(args))
+        return comm, describe(comm, args, url_m.group(0) if url_m else None), None
+    if comm not in CMDLINE_TOOLS:
+        return None
+    where = f" · {os.path.basename(cwd)}" if cwd and cwd != HOME else ""
+    if comm in ("node", "bun"):
+        script = os.path.basename(_positional(args)[0]) if _positional(args) else ""
+        pm = ("yarn" if "yarn" in script else "pnpm" if "pnpm" in script else "npm" if script in ("npm", "npm-cli.js", "npx-cli.js")
+              else comm if comm == "bun" else "")
+        if not pm:
+            return None
+        rest = _positional(args)[1:] if pm != "bun" else _positional(args)
+        verb = rest[0] if rest else ""
+        if pm == "yarn" and verb == "":
+            verb = "install"
+        if verb not in PKG_VERBS:
+            return None
+        return pm, f"{pm} {verb}{where}", None
+    if comm == "java":
+        joined = " ".join(args)
+        if "com.android.sdklib" in joined or "sdkmanager" in joined:
+            pkgs = [a for a in _positional(args) if ";" in a or a in ("platform-tools", "emulator")]
+            staging = None
+            for a in args:                        # -Dcom.android.sdklib.toolsdir=<sdk>/cmdline-tools/<v>[/bin]
+                if a.startswith("-Dcom.android.sdklib.toolsdir="):
+                    parts = a.split("=", 1)[1].rstrip("/").split(os.sep)
+                    if "cmdline-tools" in parts:
+                        sdk = os.sep.join(parts[: parts.index("cmdline-tools")]) or os.sep
+                        staging = os.path.join(sdk, ".temp")
+            if staging is None and os.environ.get("ANDROID_HOME"):
+                staging = os.path.join(os.environ["ANDROID_HOME"], ".temp")
+            return "sdkmanager", "sdkmanager " + (" ".join(pkgs)[:60] if pkgs else "update"), staging
+        if "org.gradle" in joined or "gradle-wrapper" in joined:
+            if "GradleDaemon" in joined or "GradleWrapperMain" in joined:
+                return "gradle", f"gradle{where}", None
+        return None
+    if comm == "go":
+        pos = _positional(args)
+        if pos[:2] == ["mod", "download"] or (pos and pos[0] in ("get", "install") and len(pos) > 1):
+            return "go", f"go {' '.join(pos[:2])}{where}", None
+        return None
+    if comm in ("podman", "docker"):
+        pos = _positional(args)
+        if "pull" in pos:
+            image = pos[pos.index("pull") + 1] if pos.index("pull") + 1 < len(pos) else ""
+            return comm, f"{comm} pull {image}".rstrip(), None
+        return None
+    return None
+
+
+def read_rchar(pid: int) -> int | None:
+    """Bytes this process has read from any descriptor, sockets included (/proc/<pid>/io). A cheap
+    proxy for download volume when a tool writes no single file we can watch."""
+    try:
+        with open(f"/proc/{pid}/io", "rb") as f:
+            for line in f:
+                if line.startswith(b"rchar:"):
+                    return int(line.split()[1])
+    except OSError:
+        return None
+    return None
+
+
+_DIR_CACHE: dict[str, tuple[float, int | None]] = {}
+
+
+def dir_size(path: str, cap: int = 3000, ttl: float = 2.0) -> int | None:
+    """Total bytes under a small staging directory; None if it does not exist or has more than cap
+    entries (then it is not a cheap thing to walk every second and the caller falls back)."""
+    now = time.monotonic()
+    hit = _DIR_CACHE.get(path)
+    if hit and now - hit[0] < ttl:
+        return hit[1]
+    total, seen, stack = 0, 0, [path]
+    try:
+        while stack:
+            with os.scandir(stack.pop()) as it:
+                for e in it:
+                    seen += 1
+                    if seen > cap:
+                        _DIR_CACHE[path] = (now, None)
+                        return None
+                    try:
+                        if e.is_dir(follow_symlinks=False):
+                            stack.append(e.path)
+                        elif e.is_file(follow_symlinks=False):
+                            total += e.stat(follow_symlinks=False).st_size
+                    except OSError:
+                        continue
+    except OSError:
+        _DIR_CACHE[path] = (now, None)
+        return None
+    _DIR_CACHE[path] = (now, total)
+    return total
 
 
 def describe(tool: str, args: list[str], url: str | None) -> str:
@@ -531,43 +648,69 @@ class Tracker:
         self.scan_processes(dt)
         self.steam.scan(dt, self.active, self.finished)
 
+    def measure(self, d: "Download", dt: float) -> None:
+        """Advance size/rate: from the output file when there is one, else from the staging directory,
+        else from the process's own read counter (marked approximate)."""
+        if d.path or d.fd is not None:
+            d.update_size(dt)
+            return
+        if d.staging:
+            size = dir_size(d.staging)
+            if size is not None:
+                d.approx = False
+                d.push_size(size, dt)
+                return
+        rchar = read_rchar(d.pid)
+        if rchar is None:
+            return
+        if d.io_base < 0:
+            d.io_base = rchar
+        d.approx = True
+        d.push_size(rchar - d.io_base, dt)
+
+    def retire(self, d: "Download") -> None:
+        if d.path or d.size > 0:
+            self.finished.appendleft((time.strftime("%H:%M:%S"), d.display_name, max(d.size, d.total)))
+
     def scan_processes(self, dt: float) -> None:
         seen: set[int] = set()
         for proc in psutil.process_iter(["pid", "name", "cmdline", "status"]):
             info = proc.info
             name = info["name"] or ""
-            if name not in DOWNLOADERS or info["pid"] == self.me or not info["cmdline"]:
+            if (name not in DOWNLOADERS and name not in CMDLINE_TOOLS) or info["pid"] == self.me or not info["cmdline"]:
                 continue
             if info.get("status") == psutil.STATUS_ZOMBIE:
                 continue
-            seen.add(info["pid"])
             d = self.active.get(info["pid"])
             if d is None:
                 args = info["cmdline"][1:]
-                url_m = URL_RE.search(" ".join(args))
-                url = url_m.group(0) if url_m else None
-                path = None
-                if name in FILE_TOOLS:
+                cwd = None
+                if name in CMDLINE_TOOLS or name in FILE_TOOLS:
                     try:
                         cwd = proc.cwd()
                     except (psutil.AccessDenied, psutil.NoSuchProcess):
                         cwd = None
-                    path = output_from_args(args, name, cwd)
-                d = Download(info["pid"], name, describe(name, args, url), url, path, time.monotonic())
+                kind = classify(name, args, cwd)
+                if kind is None:
+                    continue
+                tool, label, staging = kind
+                url_m = URL_RE.search(" ".join(args))
+                url = url_m.group(0) if url_m else None
+                path = output_from_args(args, tool, cwd) if tool in FILE_TOOLS else None
+                d = Download(info["pid"], tool, label, url, path, time.monotonic(), staging=staging)
                 self.active[info["pid"]] = d
+            seen.add(info["pid"])
             # a path from the arguments may not exist yet; give it a few seconds before guessing from open files
             if d.fd is None and d.tool in FILE_TOOLS and (
                     d.path is None or (not os.path.isfile(d.path) and time.monotonic() - d.first_seen > 3)):
                 found = output_from_proc(proc)
                 if found:
                     d.path, d.fd = found
-            d.update_size(dt)
+            self.measure(d, dt)
             self.apply_total(d)
         for pid in list(self.active):
             if pid not in seen and pid > 0:
-                d = self.active.pop(pid)
-                if d.path:
-                    self.finished.appendleft((time.strftime("%H:%M:%S"), d.display_name, max(d.size, d.total)))
+                self.retire(self.active.pop(pid))
 
 
 def render_auto(tracker: Tracker, net: NetMeter, width: int) -> Group:
@@ -604,6 +747,10 @@ def render_auto(tracker: Tracker, net: NetMeter, width: int) -> Group:
             age = int(time.monotonic() - d.first_seen)
             parts.append(Text.assemble(("● ", "magenta"), (d.label[: width - 24], "magenta"),
                                        (f"   {d.tool} · running {age}s", "dim")))
+            if d.samples and d.size > 0:
+                parts.append(Text.assemble("  ", ("≈ " if d.approx else "", "dim"), f"{human(d.size)} so far   ",
+                                           (f"{human(d.rate)}/s", "cyan"),
+                                           ("   (bytes read by the process)" if d.approx else "   (staging dir)", "dim")))
         parts.append(Text())
 
     if tracker.finished:

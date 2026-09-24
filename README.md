@@ -6,7 +6,8 @@ runs on its own or as a brick in a grid you describe in plain text. Written in P
 
 Panels: CPU, memory, network, disks, processes (task-manager style, mouse aware), GPU (NVIDIA via
 NVML, Intel and AMD via sysfs), temperatures, power/battery, system strip, hardware inventory,
-downloads (curl/wget/aria2c/flatpak/rsync/git/scp/pip and Steam, via the bundled `dlwatch`),
+downloads (curl/wget/aria2c/flatpak/rsync/git/scp/pip, yarn/npm/pnpm/bun installs, go mod
+  download, Android sdkmanager, gradle, podman/docker pull and Steam, via the bundled `dlwatch`),
 any shell command, and an animation panel for GIFs.
 
 ## Install
