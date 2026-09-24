@@ -610,7 +610,7 @@ title_index = true
 # their space); `g` toggles the animation panel, the ✕ button hides any panel.
 
 [layouts.default]
-rows = ["3", 3, 3, 3, 3, 2]
+rows = ["3", 3, 3, 3, 3, 3, 3]
 cols = [2, 2, 2]
 hidden = ["gif"]
 grid = """
@@ -618,8 +618,9 @@ sys  sys  sys
 cpu  cpu  gpu
 mem  net  temp
 proc proc disk
-proc proc gif
 proc proc dl
+proc proc gif
+jobs jobs jobs
 """
 
 [layouts.wide]
@@ -642,11 +643,12 @@ proc mem
 """
 
 [layouts.downloads]
-rows = ["3", 3, 5]
+rows = ["3", 3, 5, 5]
 grid = """
 sys  sys
 net  disk
 dl   dl
+jobs jobs
 """
 
 [layouts.minimal]
@@ -696,6 +698,14 @@ interval = 2.0
 
 [panels.dl]
 interval = 1.0
+
+[panels.jobs]
+interval = 1.0
+busy = true                 # also list processes burning CPU that are not a recognised job (`b` toggles)
+# busy_cpu = 40             # CPU % a process must hold, for busy_after seconds, to be listed there
+# busy_after = 8
+# busy_ignore = ["blender"] # names never listed as busy (browsers, compositors, players and VMs already are)
+finished = 4                # finished jobs kept on screen (`c` clears)
 
 [panels.hw]
 # sections = ["system", "cpu", "memory", "gpu", "storage", "network", "audio", "display", "battery", "os"]
@@ -845,7 +855,7 @@ def run_panel(panel: Panel, console: Console, theme: Theme, framed: bool = True,
             if panel.wants_hide:
                 return
             key = keys.poll(0.05)
-            if key == "q":
+            if key == "q" and not getattr(panel, "typing", False):
                 return
             if key and ":" in key:
                 kind, x, y = key.split(":")

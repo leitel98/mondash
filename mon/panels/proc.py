@@ -44,6 +44,7 @@ class ProcPanel(Panel):
         self.threads = 0
         self._cols: list[tuple[int, int, str | None]] = []       # x0, x1, sort key — filled during render for mouse
         self._body_h = 1
+        self._filt_row = 1          # 1 when the filter input box is drawn above the header (0 on tiny panels)
         self._detail_cache: tuple[int, float, list[Text]] | None = None
         try:
             self.me = psutil.Process().username()
@@ -171,13 +172,16 @@ class ProcPanel(Panel):
         elif kind == "WHEELDOWN":
             self._move(3)
         elif kind in ("CLICK", "RCLICK"):
-            if y == 0:                                   # header → sort
+            off = self._filt_row
+            if y == 0 and off:                           # filter box → start typing
+                self.typing = True
+            elif y == off:                               # header → sort
                 for x0, x1, key in self._cols:
                     if key and x0 <= x < x1:
                         self._set_sort(key)
                         break
-            elif 1 <= y <= self._body_h:
-                n = self.top + y - 1
+            elif off + 1 <= y <= off + self._body_h:
+                n = self.top + y - off - 1
                 if n < len(self.rows):
                     if n == self.sel and kind == "CLICK":
                         self.details = not self.details   # click the selected row again → details
@@ -241,6 +245,22 @@ class ProcPanel(Panel):
         return out
 
     # render ------------------------------------------------------------------
+    def _filter_box(self, width: int) -> Text:
+        th = self.theme
+        box = Text(no_wrap=True, overflow="ellipsis")
+        box.append("⌕ ", th.accent if (self.typing or self.filter) else th.dim)
+        if self.typing:
+            box.append(self.filter, "bold")
+            box.append("▏", th.accent)
+            box.append("  Enter keeps · Esc clears", th.dim)
+        elif self.filter:
+            box.append(self.filter, f"bold {th.accent}")
+            box.append(f"  {len(self.rows)} match · / edits · Esc clears", th.dim)
+        else:
+            box.append("filter: press / or click here to type", th.dim)
+        box.truncate(width, overflow="ellipsis")
+        return box
+
     def render(self, width: int, height: int):
         th = self.theme
         out: list = []
@@ -278,22 +298,22 @@ class ProcPanel(Panel):
             col("COMMAND", cmd_w)
         head.rstrip()
         self._cols = cols
+        # filter input box: always visible so it can be found and clicked; typing goes into it after `/` or a click
+        self._filt_row = 1 if (height >= 4 or self.typing or self.filter) else 0
+        if self._filt_row:
+            out.append(self._filter_box(width))
         out.append(head)
 
         footer: list[Text] = []
         if self.pending_kill:
             pid, sig, name, _ = self.pending_kill
             footer.append(Text(f" send {signal.Signals(sig).name} to {pid} {name}?  y = yes, any other key = no ", style=f"bold {th.bad}"))
-        elif self.typing:
-            footer.append(Text.assemble(("filter: ", th.accent), (self.filter + "▏", "bold"), ("  Enter keeps, Esc clears", th.dim)))
         elif self.msg:
             footer.append(Text(self.msg, style=th.warn))
-        elif self.filter:
-            footer.append(Text.assemble(("filter: ", th.dim), (self.filter, th.accent), ("  (Esc clears)", th.dim)))
         if self.details and self.rows and height >= 6:
             footer = self._details(self.rows[self.sel]["pid"], width) + footer
 
-        body_h = max(1, height - 1 - len(footer))
+        body_h = max(1, height - 1 - self._filt_row - len(footer))
         self._body_h = body_h
         if self.sel < self.top:
             self.top = self.sel

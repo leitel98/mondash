@@ -1,0 +1,6 @@
+#!/usr/bin/env python3
+"""jobsmon — everything being processed right now: builds, compilers, bundlers, tests, encoders, archivers, installs."""
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from mon.core import run_standalone
+run_standalone("jobs")

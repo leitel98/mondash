@@ -8,7 +8,8 @@ Panels: CPU, memory, network, disks, processes (task-manager style, mouse aware)
 NVML, Intel and AMD via sysfs), temperatures, power/battery, system strip, hardware inventory,
 downloads (curl/wget/aria2c/flatpak/rsync/git/scp/pip, yarn/npm/pnpm/bun installs, go mod
   download, Android sdkmanager, gradle, podman/docker pull and Steam, via the bundled `dlwatch`),
-any shell command, and an animation panel for GIFs.
+jobs (everything being processed: builds, compilers, bundlers, test runs, encoders, archivers,
+  copies, package and system installs — see below), any shell command, and an animation panel for GIFs.
 
 ## Install
 
@@ -50,8 +51,9 @@ Press `m` to hand the mouse back to the terminal when you want to select text
 
 The bottom bar always shows the global keys plus the focused panel's keys (`hints = false` hides it).
 
-Panel keys: processes `c m p n` or `←→` sort, `↑↓` select, `d` details, `/` filter, `k`/`K` kill,
-`u` mine only, `h` kernel threads, `t` divide CPU% by cores;
+Panel keys: processes `c m p n` or `←→` sort, `↑↓` select, `d` details, `/` (or click the filter box) filter,
+`k`/`K` kill, `u` mine only, `h` kernel threads, `t` divide CPU% by cores; jobs `b` busy list, `c` clear finished;
+downloads `c` clear finished;
 network `n`/`p` interface, `a` autoscale; cpu `g` core details; gpu `p` process list;
 disk `i` I/O section; temps `c` per-core; cmd `R` run now.
 
@@ -93,6 +95,26 @@ and downloads panels), talks to the NVIDIA driver through NVML instead of forkin
 whose data changed. Measured at 120x40 with all panels: roughly 5–8% of one core while a
 game was running. To spend less, raise `refresh` or a panel's `interval` in dash.toml, or
 press `-` while it runs.
+
+## Jobs
+
+The `jobs` panel (and `jobsmon` on its own) answers "what is this machine working on right now?".
+It recognises work by process name and command line — gradle/kotlin daemons, javac, gcc/clang/ld,
+rustc/cargo, go build, tsc/esbuild/webpack/vite, jest/vitest/pytest, expo/eas, make/ninja/cmake,
+docker/podman build, ffmpeg and friends, tar/zip/xz/zstd, cp/mv/dd, borg/restic/rclone,
+dnf/rpm-ostree/apt/pacman, mypy/ruff, pg_dump, terraform… — and groups everything by process tree,
+so `expo run:android` → gradle → kotlin daemon → ninja → clang shows as one row with the hottest
+member as its stage (`expo run:android · nf-mobile · C++`). Each row has the tree's CPU, memory,
+read/write rates and elapsed time. Downloads stay in `dl`; pure downloaders are never jobs.
+
+Progress bars come from history: the first run of a job shows a sweeping bar and its elapsed time;
+every finished run is remembered in `~/.cache/mon/jobs.json` (per kind, label and project folder,
+last 6 durations) and the next run shows `≈42% ETA 9m12s` against the median — turning yellow/red
+when it goes over. Servers and daemons (`expo start`, `tsc --watch`, gradle daemons) are jobs only
+while their tree is busy; a finite tool that sits idle for 30 s (a `cat` holding a pipe, a `go run`
+server) hides until it works again. Anything else that holds more than 40 % of a core for 8 s and
+is not a browser, compositor, player, terminal or VM is listed under `busy:` (`b` toggles it,
+`busy_cpu` / `busy_after` / `busy_ignore` tune it). `c` clears the finished list.
 
 ## Steam downloads
 

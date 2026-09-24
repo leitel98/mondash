@@ -4,7 +4,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN="${XDG_BIN_HOME:-$HOME/.local/bin}"
 APPS="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
-LAUNCHERS=(mondash dlwatch cpumon memmon netmon diskmon procmon gpumon tempmon powermon sysmon dlmon cmdmon hwmon gifmon)
+LAUNCHERS=(mondash dlwatch cpumon memmon netmon diskmon procmon gpumon tempmon powermon sysmon dlmon cmdmon hwmon gifmon jobsmon)
 
 if [[ "${1:-}" == "--uninstall" ]]; then
   for l in "${LAUNCHERS[@]}"; do [[ -L "$BIN/$l" ]] && rm -f "$BIN/$l"; done

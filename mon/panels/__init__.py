@@ -12,6 +12,7 @@ from .dl import DlPanel
 from .cmd import CmdPanel
 from .hw import HwPanel
 from .gif import GifPanel
+from .jobs import JobsPanel
 
 TYPES = {p.name: p for p in (CpuPanel, MemPanel, NetPanel, DiskPanel, ProcPanel, GpuPanel, TempPanel, PowerPanel,
-                             SysPanel, DlPanel, CmdPanel, HwPanel, GifPanel)}
+                             SysPanel, DlPanel, CmdPanel, HwPanel, GifPanel, JobsPanel)}

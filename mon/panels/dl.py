@@ -32,6 +32,7 @@ def make_fast_tracker(dlw):
     import psutil
 
     comm_map = {name[:15]: name for name in dlw.DOWNLOADERS | dlw.CMDLINE_TOOLS}   # /proc comm is truncated to 15 chars
+    comm_map["MainThread"] = "node"                                                # recent Node names its main thread
 
     class FastTracker(dlw.Tracker):
         def __init__(self) -> None:
@@ -97,6 +98,7 @@ class DlPanel(Panel):
     name = "dl"
     title = "Downloads"
     interval = 1.0
+    help = {"c": "clear finished"}
     options = {}
 
     def __init__(self, cfg, theme):
@@ -115,6 +117,12 @@ class DlPanel(Panel):
             return
         self.net.tick(dt)
         self.tracker.scan(dt)
+
+    def on_key(self, key: str) -> bool:
+        if key == "c" and self.dlw:
+            self.tracker.finished.clear()
+            return True
+        return False
 
     def status(self) -> str:
         return f"↓ {rate(self.net.rate)} {self.net.iface}" if self.dlw and self.net.iface else ""
