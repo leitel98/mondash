@@ -1,11 +1,13 @@
-# Publishes to PyPI on a tag. Needs a "trusted publisher" configured once on pypi.org for this repository
-# (project mondash, workflow pypi.yml, environment pypi); until then this workflow just fails harmlessly.
+# Publishes to PyPI on a tag. Setup, once: add a "trusted publisher" on pypi.org for this repository
+# (project mondash, workflow pypi.yml, environment pypi), then set the repository variable PYPI_PUBLISH=true
+# (Settings → Secrets and variables → Actions → Variables). Until then the job is skipped.
 name: pypi
 on:
   push:
     tags: ["v*"]
 jobs:
   publish:
+    if: vars.PYPI_PUBLISH == 'true'
     runs-on: ubuntu-latest
     environment: pypi
     permissions:

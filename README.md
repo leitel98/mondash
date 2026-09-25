@@ -185,6 +185,7 @@ python3 -m unittest discover -s mon/tests -t .         # classifier tests + head
 ```
 
 Pushing a tag `vX.Y.Z` runs the release workflow: it builds the wheel and sdist, a one-file binary for x86_64 and
-aarch64 (built on manylinux_2_28, so they run on any distro from 2018 on), and attaches them to a GitHub release.
-`pypi.yml` publishes the same tag to PyPI once a trusted publisher is configured for this repository on pypi.org.
+aarch64 (built on Ubuntu 22.04, so they run on any distro from 2022 on), and attaches them to a GitHub release.
+`pypi.yml` publishes the same tag to PyPI once a trusted publisher is configured for this repository on pypi.org
+and the repository variable `PYPI_PUBLISH` is set to `true`.
 The version lives in `mon/__init__.py`.
