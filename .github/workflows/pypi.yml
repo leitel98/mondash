@@ -3,6 +3,7 @@
 # (Settings → Secrets and variables → Actions → Variables). Until then the job is skipped.
 name: pypi
 on:
+  workflow_dispatch:
   push:
     tags: ["v*"]
 jobs:
