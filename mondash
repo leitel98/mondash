@@ -1,6 +1,0 @@
-#!/usr/bin/env python3
-"""mondash — lego terminal dashboard. Layout and theme live in ~/.config/mon/dash.toml (created on first run)."""
-import os, sys
-sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
-from mon.dash import main
-main()

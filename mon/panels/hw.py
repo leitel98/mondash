@@ -5,6 +5,7 @@ Everything comes from sysfs, udev's DMI export and lspci, so no root is needed. 
 from __future__ import annotations
 
 import glob
+import math
 import os
 import platform
 import re
@@ -16,6 +17,7 @@ from rich.text import Text
 
 from . import _nvidia
 from ..core import Panel, fit, human, read_file, read_int
+from ..host import cpu_model, os_name
 
 JEDEC = {"802C": "Micron", "80AD": "SK hynix", "80CE": "Samsung", "0198": "Kingston", "029E": "Corsair", "04CB": "ADATA",
          "059B": "Crucial", "04CD": "G.Skill", "01F7": "Team Group", "0B0B": "Lexar", "8A76": "Leven"}
@@ -90,13 +92,7 @@ class HwPanel(Panel):
 
     def _cpu(self) -> list[tuple[str, str]]:
         info = read_file("/proc/cpuinfo") or ""
-        model = ""
-        for line in info.splitlines():
-            if line.startswith("model name"):
-                model = line.split(":", 1)[1].strip()
-                break
-        model = re.sub(r"\((R|TM)\)", "", model).replace(" CPU", "")
-        model = " ".join(model.split())
+        model = cpu_model()
         cores = len({l.split(":")[1].strip() for l in info.splitlines() if l.startswith("core id")}) or 0
         threads = info.count("processor\t:")
         rows = [("model", model)]
@@ -232,7 +228,6 @@ class HwPanel(Panel):
                 mfg = ((edid[8] << 8) | edid[9])
                 letters = "".join(chr(64 + ((mfg >> s) & 31)) for s in (10, 5, 0))
                 w_cm, h_cm = edid[21], edid[22]
-                import math
                 inch = math.hypot(w_cm, h_cm) / 2.54 if w_cm and h_cm else 0
                 desc += f"  {letters}" + (f"  {inch:.1f}\"" if inch else "")
                 for i in range(54, 126, 18):
@@ -263,11 +258,7 @@ class HwPanel(Panel):
         return rows
 
     def _os(self) -> list[tuple[str, str]]:
-        pretty = ""
-        for line in (read_file("/etc/os-release") or "").splitlines():
-            if line.startswith("PRETTY_NAME="):
-                pretty = line.split("=", 1)[1].strip('"')
-        rows = [("distro", pretty or platform.system()), ("kernel", platform.release())]
+        rows = [("distro", os_name()), ("kernel", platform.release())]
         de = os.environ.get("XDG_CURRENT_DESKTOP") or os.environ.get("DESKTOP_SESSION")
         if de:
             rows.append(("desktop", f"{de}  ·  {os.environ.get('XDG_SESSION_TYPE', '')}".strip(" ·")))

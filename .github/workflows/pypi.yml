@@ -1,0 +1,19 @@
+# Publishes to PyPI on a tag. Needs a "trusted publisher" configured once on pypi.org for this repository
+# (project mondash, workflow pypi.yml, environment pypi); until then this workflow just fails harmlessly.
+name: pypi
+on:
+  push:
+    tags: ["v*"]
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install build && python -m build
+      - uses: pypa/gh-action-pypi-publish@release/v1

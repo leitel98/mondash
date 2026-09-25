@@ -6,10 +6,25 @@ from rich.console import Group
 from rich.text import Text
 
 from . import _nvidia
-from ..core import Hist, Panel, bar, braille_graph, fit, kv_line, pad, sparkline, temperatures
+from ..core import Hist, Panel, bar, braille_graph, fit, kv_line, pad, temperatures
 
-NICE = {"coretemp": "cpu", "k10temp": "cpu", "zenpower": "cpu", "nvme": "nvme", "pch_cannonlake": "pch", "iwlwifi_1": "wifi",
-        "acpitz": "acpi", "amdgpu": "gpu", "BAT1": "bat", "thinkpad": "fan"}
+NICE = {"coretemp": "cpu", "k10temp": "cpu", "zenpower": "cpu", "cpu_thermal": "cpu", "nvme": "nvme", "acpitz": "acpi",
+        "amdgpu": "gpu", "radeon": "gpu", "nouveau": "gpu", "i915": "gpu", "xe": "gpu", "thinkpad": "fan", "dell_smm": "fan",
+        "asus": "board", "nct6775": "board", "it87": "board", "drivetemp": "disk", "mt7921_phy0": "wifi", "spd5118": "ram"}
+
+
+def nice_chip(chip: str) -> str:
+    """Short label for a hwmon chip name: known ones from NICE, otherwise the name without its index/suffix."""
+    if chip in NICE:
+        return NICE[chip]
+    base = chip.split("_")[0].split("-")[0]
+    if base.startswith("pch"):
+        return "pch"
+    if base.startswith(("iwlwifi", "ath", "mt79", "rtw", "brcm")):
+        return "wifi"
+    if base.upper().startswith("BAT"):
+        return "bat"
+    return base[:5]
 
 
 class TempPanel(Panel):
@@ -44,7 +59,7 @@ class TempPanel(Panel):
                     continue
                 if label.startswith("Package id"):
                     label = "package"
-                readings.append((NICE.get(chip, chip), label, e.current, e.high, e.critical))
+                readings.append((nice_chip(chip), label, e.current, e.high, e.critical))
         snap = _nvidia.poll(max_age=1.5)
         for g in snap["gpus"]:
             if g.get("temperature.gpu") is not None:

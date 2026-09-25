@@ -1,0 +1,63 @@
+[build-system]
+requires = ["hatchling>=1.21"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mondash"
+dynamic = ["version"]
+description = "Lego-style terminal dashboard for Linux: cpu, gpu, memory, network, disks, processes, temps, power, downloads and jobs as independent monitors"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+authors = [{ name = "leitel" }]
+keywords = ["monitor", "dashboard", "terminal", "tui", "btop", "system", "gpu", "downloads"]
+classifiers = [
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: System :: Monitoring",
+]
+dependencies = [
+    "rich>=13",
+    "psutil>=5.9",
+]
+
+[project.optional-dependencies]
+gif = ["pillow>=9"]          # GIF playback in the animation panel (built-in effects work without it)
+
+[project.urls]
+Homepage = "https://github.com/leitel98/mondash"
+Issues = "https://github.com/leitel98/mondash/issues"
+
+# Every command is the same entry point; it looks at its own name (cpumon → the cpu panel) or at the
+# first argument (mondash cpu). That is what lets one PyInstaller binary provide all of them too.
+[project.scripts]
+mondash = "mon.cli:main"
+dlwatch = "mon.cli:main"
+cpumon = "mon.cli:main"
+memmon = "mon.cli:main"
+netmon = "mon.cli:main"
+diskmon = "mon.cli:main"
+procmon = "mon.cli:main"
+gpumon = "mon.cli:main"
+tempmon = "mon.cli:main"
+powermon = "mon.cli:main"
+sysmon = "mon.cli:main"
+dlmon = "mon.cli:main"
+cmdmon = "mon.cli:main"
+hwmon = "mon.cli:main"
+gifmon = "mon.cli:main"
+jobsmon = "mon.cli:main"
+
+[tool.hatch.version]
+path = "mon/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["mon"]
+
+[tool.hatch.build.targets.sdist]
+include = ["mon", "README.md", "LICENSE", "pyproject.toml"]
+exclude = ["**/__pycache__"]

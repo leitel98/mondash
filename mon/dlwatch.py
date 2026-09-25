@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """dlwatch — see everything that is downloading right now, with a live bar for each.
 
 Usage:
@@ -12,7 +11,8 @@ Usage:
 
 Keys: q quits.
 
-Needs: python3, psutil, rich, requests   (pip install --user rich psutil requests)
+The tracking logic here is also what the dashboard's `dl` panel shows. Extra downloaders can be named in
+dash.toml: [panels.dl] tools = ["axel", "lftp"], and `ignore` hides ones you never want listed.
 """
 from __future__ import annotations
 
@@ -20,13 +20,11 @@ import argparse
 import glob
 import os
 import re
-import select
-import shutil
-import subprocess
 import sys
-import termios
 import time
-import tty
+import urllib.error
+import urllib.parse
+import urllib.request
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -39,40 +37,33 @@ from rich.progress_bar import ProgressBar
 from rich.table import Table
 from rich.text import Text
 
-# --------------------------------------------------------------------------- helpers
+from .core import Keys, duration, human, relaunch_in_window, self_argv
+from .host import HOME, default_iface, tilde
+from .procscan import SCANNER
 
-DOWNLOADERS = {"curl", "wget", "aria2c", "rsync", "flatpak", "git", "git-remote-https", "scp", "pip", "pip3"}
-FILE_TOOLS = {"curl", "wget", "aria2c"}           # tools where one output file can be tracked
+# --------------------------------------------------------------------------- what counts as a download
+
+DOWNLOADERS = {"curl", "wget", "wget2", "aria2c", "axel", "rsync", "flatpak", "git", "git-remote-https",   # /proc shows both
+               "scp", "sftp", "pip", "pip3", "lftp", "snap", "megadl", "gallery-dl", "youtube-dl", "yt-dlp"}
+FILE_TOOLS = {"curl", "wget", "wget2", "aria2c", "axel", "lftp", "megadl"}     # tools where one output file can be tracked
 # Runtimes whose process name says nothing: the tool is recognised from the command line instead
 # (yarn/npm/pnpm under node, sdkmanager/gradle under java, go mod download, podman/docker pull).
-CMDLINE_TOOLS = {"node", "java", "go", "podman", "docker", "bun"}
-PKG_VERBS = {"install", "i", "ci", "add", "update", "up", "upgrade", "install-test", "it"}
+CMDLINE_TOOLS = {"node", "java", "go", "podman", "docker", "bun", "deno", "cargo", "uv", "pipx", "conda", "mamba"}
+PKG_VERBS = {"install", "i", "ci", "add", "update", "up", "upgrade", "install-test", "it", "sync", "pull"}
 URL_RE = re.compile(r"(?:https?|ftp)://[^\s\"']+")
 APPID_RE = re.compile(r"[A-Za-z0-9_]+(?:\.[A-Za-z0-9_-]+){2,}")
 SKIP_PREFIX = ("/dev/", "/proc/", "/sys/", "/run/")
-HOME = str(Path.home())
-
-
-def human(n: float) -> str:
-    n = float(n or 0)
-    for unit in ("B", "KB", "MB", "GB", "TB"):
-        if n < 1024 or unit == "TB":
-            return f"{n:.0f}{unit}" if unit == "B" else f"{n:.1f}{unit}"
-        n /= 1024
-    return f"{n:.1f}TB"
+STEAM_ROOTS = ("~/.local/share/Steam", "~/.steam/steam", "~/.steam/root",
+               "~/.var/app/com.valvesoftware.Steam/.local/share/Steam",          # Flatpak
+               "~/snap/steam/common/.local/share/Steam")                          # Snap
 
 
 def eta(seconds: float | None) -> str:
-    if seconds is None or seconds <= 0:
-        return "--"
-    s = int(seconds)
-    if s >= 3600:
-        return f"{s // 3600}h{s % 3600 // 60:02d}m"
-    return f"{s // 60}m{s % 60:02d}s"
+    return "--" if seconds is None or seconds <= 0 else duration(seconds)
 
 
 def shorten(path: str, width: int) -> str:
-    p = path.replace(HOME, "~", 1) if path.startswith(HOME) else path
+    p = tilde(path)
     if len(p) <= width:
         return p
     half = max(4, width // 2 - 1)
@@ -92,18 +83,6 @@ def parse_total(text: str | None) -> tuple[str, int]:
     return "bytes", int(float(m.group(1)) * mult)
 
 
-def default_iface() -> str | None:
-    try:
-        for line in Path("/proc/net/route").read_text().splitlines()[1:]:
-            parts = line.split()
-            if parts[1] == "00000000":      # default route
-                return parts[0]
-    except OSError:
-        pass
-    stats = {k: v.bytes_recv for k, v in psutil.net_io_counters(pernic=True).items() if k != "lo"}
-    return max(stats, key=stats.get) if stats else None
-
-
 class NetMeter:
     def __init__(self) -> None:
         self.iface = default_iface()
@@ -121,45 +100,31 @@ class NetMeter:
         return self.rate
 
 
-class Keys:
-    """Non-blocking single-key reader. Does nothing if stdin is not a terminal."""
-
-    def __init__(self) -> None:
-        self.fd = sys.stdin.fileno() if sys.stdin.isatty() else None
-        self.saved = termios.tcgetattr(self.fd) if self.fd is not None else None
-
-    def __enter__(self) -> "Keys":
-        if self.fd is not None:
-            tty.setcbreak(self.fd)
-        return self
-
-    def __exit__(self, *_: object) -> None:
-        if self.fd is not None:
-            termios.tcsetattr(self.fd, termios.TCSADRAIN, self.saved)
-
-    def poll(self) -> str | None:
-        if self.fd is None:
-            return None
-        ready, _, _ = select.select([sys.stdin], [], [], 0)
-        return sys.stdin.read(1) if ready else None
-
-
 def wait_or_quit(keys: Keys, seconds: float) -> bool:
     """Sleep `seconds`, returning True early if 'q' was pressed."""
     end = time.monotonic() + seconds
     while time.monotonic() < end:
-        if keys.poll() == "q":
+        if keys.poll(0.1) == "q":
             return True
-        time.sleep(0.1)
     return False
 
 
 # --------------------------------------------------------------------------- auto mode
 
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Follow redirects ourselves so a HEAD that turns into a GET on redirect still stays a HEAD."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        new = urllib.request.Request(newurl, method="HEAD", headers=dict(req.headers))
+        return new
+
+
 class SizeProbe:
-    """Asks each URL once for Content-Length, in the background."""
+    """Asks each URL once for Content-Length, in the background (standard library only)."""
 
     RETRY_AFTER = 30.0          # a failed probe (0) is retried after this many seconds
+    TIMEOUT = 12
 
     def __init__(self) -> None:
         self.pool = ThreadPoolExecutor(max_workers=4)
@@ -174,7 +139,7 @@ class SizeProbe:
             del self.results[url]                        # stale failure: probe again
         fut = self.pending.get(url)
         if fut is None:
-            self.pending[url] = self.pool.submit(self._head, url)
+            self.pending[url] = self.pool.submit(self.head, url)
         elif fut.done():
             self.results[url] = fut.result()
             if not self.results[url]:
@@ -183,25 +148,39 @@ class SizeProbe:
             return self.results[url]
         return 0
 
-    @staticmethod
-    def _head(url: str) -> int:
+    @classmethod
+    def _head(cls, url: str, headers: dict) -> tuple[int, dict, int]:
+        """(status, headers, content-length) for a HEAD request, redirects followed, errors returned not raised."""
+        opener = urllib.request.build_opener(_NoRedirect)
+        req = urllib.request.Request(url, method="HEAD", headers=headers)
         try:
-            import requests
+            with opener.open(req, timeout=cls.TIMEOUT) as r:
+                return r.status, dict(r.headers), int(r.headers.get("Content-Length") or 0)
+        except urllib.error.HTTPError as e:
+            return e.code, dict(e.headers), 0
+
+    @classmethod
+    def head(cls, url: str) -> int:
+        try:
             headers = {"User-Agent": "dlwatch-probe"}
-            r = requests.head(url, allow_redirects=True, timeout=12, headers=headers)
-            if r.status_code == 401 and "bearer" in r.headers.get("WWW-Authenticate", "").lower():
+            status, hdrs, length = cls._head(url, headers)
+            auth = {k.lower(): v for k, v in hdrs.items()}.get("www-authenticate", "")
+            if status == 401 and "bearer" in auth.lower():
                 # OCI registry (Homebrew bottles on ghcr.io etc.): fetch an anonymous pull token and retry
-                fields = dict(re.findall(r'(\w+)="([^"]*)"', r.headers["WWW-Authenticate"]))
+                fields = dict(re.findall(r'(\w+)="([^"]*)"', auth))
                 if fields.get("realm"):
-                    tok = requests.get(fields["realm"], params={k: v for k, v in fields.items() if k in ("service", "scope")},
-                                       timeout=12, headers=headers)
-                    token = tok.json().get("token") or tok.json().get("access_token") if tok.ok else None
+                    q = urllib.parse.urlencode({k: v for k, v in fields.items() if k in ("service", "scope")})
+                    req = urllib.request.Request(fields["realm"] + ("?" + q if q else ""), headers=headers)
+                    with urllib.request.urlopen(req, timeout=cls.TIMEOUT) as r:
+                        import json
+                        tok = json.loads(r.read().decode() or "{}")
+                    token = tok.get("token") or tok.get("access_token")
                     if token:
                         headers["Authorization"] = f"Bearer {token}"
-                        r = requests.head(url, allow_redirects=True, timeout=12, headers=headers)
-            if r.status_code >= 400:              # error bodies are tiny JSON, not the file
+                        status, hdrs, length = cls._head(url, headers)
+            if status >= 400:              # error bodies are tiny JSON, not the file
                 return 0
-            return int(r.headers.get("Content-Length", 0))
+            return length
         except Exception:
             return 0
 
@@ -241,7 +220,7 @@ class Download:
         m = re.match(r"^[0-9a-f]{40,64}--(.+)$", n)
         if m:
             n = m.group(1)
-        for suf in (".incomplete", ".part", ".crdownload", ".download", ".partial", ".tmp"):
+        for suf in (".incomplete", ".part", ".crdownload", ".download", ".partial", ".tmp", ".aria2"):
             if n.endswith(suf) and len(n) > len(suf):
                 n = n[: -len(suf)]
         m = re.match(r"^(.+?)--(.+?)\.[a-z0-9_]+_(?:linux|darwin|sonoma|sequoia|ventura|monterey)\.bottle(?:\.\d+)?\.tar\.gz$", n)
@@ -254,14 +233,14 @@ class Download:
         return min(100, self.size * 100 // self.total) if self.total else 0
 
     def push_size(self, size: int, dt: float) -> None:
-        """Feed a size observed elsewhere (not from a file) into the smoothed rate."""
+        """Feed a new size observation into the smoothed rate."""
         delta = max(0, size - self.size) / dt
         if self.samples == 0:
-            self.rate = 0.0
+            self.rate = 0.0                       # first look: no speed yet
         elif self.samples == 1:
-            self.rate = delta
+            self.rate = delta                     # second look: raw speed
         else:
-            self.rate = self.rate * 0.7 + delta * 0.3
+            self.rate = self.rate * 0.7 + delta * 0.3   # then smoothed
         self.size = size
         self.samples += 1
 
@@ -281,15 +260,7 @@ class Download:
                 return
         if size is None:
             return
-        delta = max(0, size - self.size) / dt
-        if self.samples == 0:
-            self.rate = 0.0                       # first look: no speed yet
-        elif self.samples == 1:
-            self.rate = delta                     # second look: raw speed
-        else:
-            self.rate = self.rate * 0.7 + delta * 0.3   # then smoothed
-        self.size = size
-        self.samples += 1
+        self.push_size(size, dt)
 
     @property
     def eta_seconds(self) -> float | None:
@@ -321,10 +292,11 @@ def output_from_args(args: list[str], tool: str = "", cwd: str | None = None) ->
     return out
 
 
-def output_from_proc(proc: psutil.Process) -> tuple[str, int | None] | None:
+def output_from_proc(pid: int) -> tuple[str, int | None] | None:
+    """The file a downloader is writing, from its open descriptors: (path, fd)."""
     try:
-        files = proc.open_files()
-    except (psutil.AccessDenied, psutil.NoSuchProcess):
+        files = psutil.Process(pid).open_files()
+    except (psutil.AccessDenied, psutil.NoSuchProcess, psutil.ZombieProcess):
         return None
     for f in files:
         p = f.path
@@ -343,36 +315,51 @@ def _positional(args: list[str]) -> list[str]:
     return [a for a in args if not a.startswith("-")]
 
 
-def classify(comm: str, args: list[str], cwd: str | None = None) -> tuple[str, str, str | None] | None:
+def _pm_from_script(comm: str, script: str) -> str:
+    if comm == "bun":
+        return "bun"
+    if "yarn" in script:
+        return "yarn"
+    if "pnpm" in script:
+        return "pnpm"
+    if script in ("npm", "npm-cli.js", "npx-cli.js"):
+        return "npm"
+    return ""
+
+
+def classify(comm: str, args: list[str], cwd: str | None = None,
+             downloaders: set[str] = DOWNLOADERS) -> tuple[str, str, str | None] | None:
     """(tool, label, staging_dir) when this process is downloading, else None.
 
-    comm is the /proc name (15 chars), args the command line without argv[0]. Tools in DOWNLOADERS
+    comm is the /proc name (15 chars), args the command line without argv[0]. Tools in `downloaders`
     match on the name alone; CMDLINE_TOOLS are runtimes, so the verb decides (a dev server run by
     yarn is not a download, `yarn install` is). staging_dir, when known, is a small directory whose
     growth is the download; otherwise progress comes from the process's read counter."""
-    if comm in DOWNLOADERS:
+    if comm in downloaders:
         url_m = URL_RE.search(" ".join(args))
         return comm, describe(comm, args, url_m.group(0) if url_m else None), None
     if comm not in CMDLINE_TOOLS:
         return None
+    pos = _positional(args)
     where = f" · {os.path.basename(cwd)}" if cwd and cwd != HOME else ""
     if comm in ("node", "bun"):
-        script = os.path.basename(_positional(args)[0]) if _positional(args) else ""
-        pm = ("yarn" if "yarn" in script else "pnpm" if "pnpm" in script else "npm" if script in ("npm", "npm-cli.js", "npx-cli.js")
-              else comm if comm == "bun" else "")
+        script = os.path.basename(pos[0]) if pos else ""
+        pm = _pm_from_script(comm, script)
         if not pm:
             return None
-        rest = _positional(args)[1:] if pm != "bun" else _positional(args)
+        rest = pos[1:] if pm != "bun" else pos
         verb = rest[0] if rest else ""
         if pm == "yarn" and verb == "":
             verb = "install"
         if verb not in PKG_VERBS:
             return None
         return pm, f"{pm} {verb}{where}", None
+    if comm == "deno":
+        return ("deno", f"deno {pos[0]}{where}", None) if pos[:1] and pos[0] in ("install", "add", "cache") else None
     if comm == "java":
         joined = " ".join(args)
         if "com.android.sdklib" in joined or "sdkmanager" in joined:
-            pkgs = [a for a in _positional(args) if ";" in a or a in ("platform-tools", "emulator")]
+            pkgs = [a for a in pos if ";" in a or a in ("platform-tools", "emulator")]
             staging = None
             for a in args:                        # -Dcom.android.sdklib.toolsdir=<sdk>/cmdline-tools/<v>[/bin]
                 if a.startswith("-Dcom.android.sdklib.toolsdir="):
@@ -388,12 +375,19 @@ def classify(comm: str, args: list[str], cwd: str | None = None) -> tuple[str, s
                 return "gradle", f"gradle{where}", None
         return None
     if comm == "go":
-        pos = _positional(args)
         if pos[:2] == ["mod", "download"] or (pos and pos[0] in ("get", "install") and len(pos) > 1):
             return "go", f"go {' '.join(pos[:2])}{where}", None
         return None
+    if comm == "cargo":
+        if pos[:1] and pos[0] in ("fetch", "vendor") or (pos[:1] == ["install"] and len(pos) > 1):
+            return "cargo", f"cargo {pos[0]}{where}", None
+        return None
+    if comm in ("uv", "pipx", "conda", "mamba"):
+        verb = pos[0] if pos else ""
+        if verb in PKG_VERBS or (comm == "uv" and pos[:2] in (["pip", "install"], ["tool", "install"], ["python", "install"])):
+            return comm, f"{comm} {' '.join(pos[:2])[:24]}{where}", None
+        return None
     if comm in ("podman", "docker"):
-        pos = _positional(args)
         if "pull" in pos:
             image = pos[pos.index("pull") + 1] if pos.index("pull") + 1 < len(pos) else ""
             return comm, f"{comm} pull {image}".rstrip(), None
@@ -456,16 +450,20 @@ def describe(tool: str, args: list[str], url: str | None) -> str:
         if m:
             return f"flatpak {verb} {m.group(0)}".replace("  ", " ")
         return f"flatpak {verb or 'update'}" + (" (all apps)" if verb in ("", "update", "upgrade") else "")
-    if tool in ("rsync", "scp"):
+    if tool == "snap":
+        pos = _positional(args)
+        return f"snap {' '.join(pos[:2])}".strip() if pos[:1] and pos[0] in ("install", "refresh", "download") else f"snap {cmd[:30]}"
+    if tool in ("rsync", "scp", "sftp"):
         return f"{tool} → {args[-1] if args else ''}"
     if tool.startswith("git"):
         return f"git {url or 'clone/fetch'}"
     if tool.startswith("pip"):
         return f"pip {args[-1] if args else ''}"
+    if tool in ("yt-dlp", "youtube-dl", "gallery-dl"):
+        return f"{tool} {url or cmd[:40]}"
     return url or cmd
 
 
-STEAM_ROOTS = ("~/.local/share/Steam", "~/.steam/steam", "~/.var/app/com.valvesoftware.Steam/.local/share/Steam")
 STEAM_FLAG_RUNNING = 1024           # StateFlags bit set while Steam is actively downloading/updating an app
 STEAM_FLAG_INSTALLED = 4
 ACF_KV_RE = re.compile(r'^\s*"([A-Za-z]+)"\s+"([^"]*)"', re.M)
@@ -474,8 +472,11 @@ ACF_KV_RE = re.compile(r'^\s*"([A-Za-z]+)"\s+"([^"]*)"', re.M)
 class SteamTracker:
     """Steam downloads: read steamapps/appmanifest_*.acf in every library (no downloader process to watch)."""
 
+    RESCAN_LIBS = 120.0     # seconds between looks for new library folders
+
     def __init__(self) -> None:
         self.libs = self._libraries()
+        self.libs_at = time.monotonic()
         self.known: set[int] = set()
 
     @staticmethod
@@ -556,6 +557,9 @@ class SteamTracker:
     def scan(self, dt: float, active: dict[int, Download], finished: deque) -> set[int]:
         """Update `active` with Steam entries (keyed by -appid). Returns the keys seen this round."""
         seen: set[int] = set()
+        now = time.monotonic()
+        if now - self.libs_at > self.RESCAN_LIBS:            # Steam installed or a library added while we run
+            self.libs, self.libs_at = self._libraries(), now
         for lib in self.libs:
             for mf in glob.glob(os.path.join(lib, "steamapps", "appmanifest_*.acf")):
                 try:
@@ -628,7 +632,29 @@ class SteamTracker:
 
 
 class Tracker:
-    def apply_total(self, d: "Download") -> None:
+    """Finds downloader processes in the shared /proc snapshot, measures each one, plus Steam.
+
+    `tools` adds process names that count as downloaders on this machine (they are also given the
+    open-file treatment, so a bar appears when the output file and a Content-Length can be found);
+    `ignore` removes names you never want listed."""
+
+    def __init__(self, tools: set[str] | None = None, ignore: set[str] | None = None) -> None:
+        self.active: dict[int, Download] = {}
+        self.finished: deque[tuple[str, str, int]] = deque(maxlen=8)
+        self.probe = SizeProbe()
+        self.me = os.getpid()
+        self.steam = SteamTracker()
+        extra = {t for t in (tools or set()) if t}
+        self.ignore = set(ignore or set())
+        self.downloaders = (DOWNLOADERS | extra) - self.ignore
+        self.file_tools = (FILE_TOOLS | extra) - self.ignore
+        self.cmdline_tools = CMDLINE_TOOLS - self.ignore
+        # /proc comm is truncated to 15 chars: map what /proc shows back to the full tool name
+        self.comm_map = {name[:15]: name for name in self.downloaders | self.cmdline_tools}
+        self.comm_map["MainThread"] = "node"                                            # recent Node names its main thread
+        self.kinds: dict[int, tuple | None] = {}     # pid -> classify() result, so a runtime's cmdline is read once
+
+    def apply_total(self, d: Download) -> None:
         """Probe the URL for a total; drop totals the file has already outgrown (redirect/error bodies)."""
         if d.path and d.url and not d.total:
             d.total = self.probe.get(d.url)
@@ -637,18 +663,11 @@ class Tracker:
             if d.url:
                 self.probe.results[d.url] = 0
 
-    def __init__(self) -> None:
-        self.active: dict[int, Download] = {}
-        self.finished: deque[tuple[str, str, int]] = deque(maxlen=8)
-        self.probe = SizeProbe()
-        self.me = os.getpid()
-        self.steam = SteamTracker()
-
     def scan(self, dt: float) -> None:
         self.scan_processes(dt)
         self.steam.scan(dt, self.active, self.finished)
 
-    def measure(self, d: "Download", dt: float) -> None:
+    def measure(self, d: Download, dt: float) -> None:
         """Advance size/rate: from the output file when there is one, else from the staging directory,
         else from the process's own read counter (marked approximate)."""
         if d.path or d.fd is not None:
@@ -668,42 +687,53 @@ class Tracker:
         d.approx = True
         d.push_size(rchar - d.io_base, dt)
 
-    def retire(self, d: "Download") -> None:
+    def retire(self, d: Download) -> None:
         if d.path or d.size > 0:
             self.finished.appendleft((time.strftime("%H:%M:%S"), d.display_name, max(d.size, d.total)))
 
-    def scan_processes(self, dt: float) -> None:
-        seen: set[int] = set()
-        for proc in psutil.process_iter(["pid", "name", "cmdline", "status"]):
-            info = proc.info
-            name = info["name"] or ""
-            if (name not in DOWNLOADERS and name not in CMDLINE_TOOLS) or info["pid"] == self.me or not info["cmdline"]:
-                continue
-            if info.get("status") == psutil.STATUS_ZOMBIE:
-                continue
-            d = self.active.get(info["pid"])
-            if d is None:
-                args = info["cmdline"][1:]
+    def _classify_row(self, row: dict, comm: str) -> tuple | None:
+        pid = row["pid"]
+        if pid in self.kinds:
+            return self.kinds[pid]
+        cmd = SCANNER.cmdline(row)
+        args = cmd.split(" ")[1:] if cmd and not cmd.startswith("[") else []
+        cwd = None
+        if comm in self.cmdline_tools or comm in self.file_tools:
+            try:
+                cwd = os.readlink(f"/proc/{pid}/cwd")
+            except OSError:
                 cwd = None
-                if name in CMDLINE_TOOLS or name in FILE_TOOLS:
-                    try:
-                        cwd = proc.cwd()
-                    except (psutil.AccessDenied, psutil.NoSuchProcess):
-                        cwd = None
-                kind = classify(name, args, cwd)
+        kind = classify(comm, args, cwd, self.downloaders) if (args or comm == "flatpak") else None
+        if kind is not None:
+            kind = (*kind, args, cwd)
+        self.kinds[pid] = kind
+        return kind
+
+    def scan_processes(self, dt: float) -> None:
+        snap = SCANNER.snapshot(0.5)
+        seen: set[int] = set()
+        for row in snap.rows:
+            comm = self.comm_map.get(row["name"])
+            if not comm or row["pid"] == self.me or row["kernel"] or row["st"] == "Z":
+                continue
+            pid = row["pid"]
+            d = self.active.get(pid)
+            if d is None:
+                kind = self._classify_row(row, comm)
                 if kind is None:
+                    seen.add(pid)                       # keep the negative answer cached while it lives
                     continue
-                tool, label, staging = kind
+                tool, label, staging, args, cwd = kind
                 url_m = URL_RE.search(" ".join(args))
                 url = url_m.group(0) if url_m else None
-                path = output_from_args(args, tool, cwd) if tool in FILE_TOOLS else None
-                d = Download(info["pid"], tool, label, url, path, time.monotonic(), staging=staging)
-                self.active[info["pid"]] = d
-            seen.add(info["pid"])
+                path = output_from_args(args, tool, cwd) if tool in self.file_tools else None
+                d = Download(pid, tool, label, url, path, time.monotonic(), staging=staging)
+                self.active[pid] = d
+            seen.add(pid)
             # a path from the arguments may not exist yet; give it a few seconds before guessing from open files
-            if d.fd is None and d.tool in FILE_TOOLS and (
+            if d.fd is None and d.tool in self.file_tools and (
                     d.path is None or (not os.path.isfile(d.path) and time.monotonic() - d.first_seen > 3)):
-                found = output_from_proc(proc)
+                found = output_from_proc(pid)
                 if found:
                     d.path, d.fd = found
             self.measure(d, dt)
@@ -711,6 +741,9 @@ class Tracker:
         for pid in list(self.active):
             if pid not in seen and pid > 0:
                 self.retire(self.active.pop(pid))
+        for pid in list(self.kinds):
+            if pid not in seen:
+                del self.kinds[pid]
 
 
 def render_auto(tracker: Tracker, net: NetMeter, width: int) -> Group:
@@ -762,8 +795,8 @@ def render_auto(tracker: Tracker, net: NetMeter, width: int) -> Group:
     return Group(*parts)
 
 
-def run_auto(console: Console) -> None:
-    tracker, net = Tracker(), NetMeter()
+def run_auto(console: Console, tools: set[str] | None = None, ignore: set[str] | None = None) -> None:
+    tracker, net = Tracker(tools, ignore), NetMeter()
     last = time.monotonic()
     with Keys() as keys, Live(console=console, screen=True, auto_refresh=False) as live:
         while True:
@@ -828,7 +861,7 @@ def run_folder(console: Console, folder: Path, total_text: str | None, pattern: 
                     parts.extend([Text(), Text.assemble(("log: ", "dim"), (tail[-1] if tail else "")[: console.width - 6])])
                 except OSError:
                     pass
-            parts.extend([Text(), Text(f"elapsed {int(elapsed) // 60}m{int(elapsed) % 60:02d}s · q quit", style="dim")])
+            parts.extend([Text(), Text(f"elapsed {duration(elapsed)} · q quit", style="dim")])
             live.update(Group(*parts), refresh=True)
             if wait_or_quit(keys, 1.0):
                 break
@@ -836,35 +869,29 @@ def run_folder(console: Console, folder: Path, total_text: str | None, pattern: 
 
 # --------------------------------------------------------------------------- main
 
-def relaunch_in_window(argv: list[str]) -> None:
-    me = os.path.abspath(__file__)
-    for term, pre in (("konsole", ["konsole", "--title", "dlwatch", "-e"]), ("gnome-terminal", ["gnome-terminal", "--"]),
-                      ("ptyxis", ["ptyxis", "--"]), ("xterm", ["xterm", "-T", "dlwatch", "-e"])):
-        if shutil.which(term):
-            subprocess.Popen(pre + [me] + argv, start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            return
-    sys.exit("dlwatch: no terminal emulator found")
-
-
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(prog="dlwatch", description=__doc__.split("\n\n")[0],
                                  formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__.split("\n", 2)[2])
     ap.add_argument("dir", nargs="?", help="folder mode: folder to watch")
     ap.add_argument("total", nargs="?", help="folder mode: expected file count (93) or size (4.7G)")
     ap.add_argument("-p", "--pattern", default="*", help="folder mode: only count files matching this glob")
     ap.add_argument("-l", "--log", help="folder mode: show the last line of this log file")
+    ap.add_argument("-t", "--tool", action="append", default=[], metavar="NAME",
+                    help="extra process name to treat as a downloader (also: [panels.dl] tools in dash.toml)")
     ap.add_argument("-w", "--window", action="store_true", help="open in a new terminal window")
-    a = ap.parse_args()
+    a = ap.parse_args(argv)
 
     if a.window:
-        relaunch_in_window([x for x in sys.argv[1:] if x not in ("-w", "--window")])
+        relaunch_in_window(self_argv(), "dlwatch")
         return
     console = Console()
     try:
         if a.dir:
             run_folder(console, Path(a.dir).expanduser(), a.total, a.pattern, a.log)
         else:
-            run_auto(console)
+            from .core import load_config
+            cfg = load_config().get("panels", {}).get("dl", {})
+            run_auto(console, set(cfg.get("tools", [])) | set(a.tool), set(cfg.get("ignore", [])))
     except KeyboardInterrupt:
         pass
 

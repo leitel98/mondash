@@ -9,7 +9,6 @@ import glob
 import math
 import os
 import random
-import time
 
 from rich.color import Color, ColorType
 from rich.color_triplet import ColorTriplet
@@ -17,7 +16,7 @@ from rich.console import Group
 from rich.style import Style
 from rich.text import Text
 
-from ..core import SCRIPTS_DIR, Panel, fit, tilde
+from ..core import BUNDLED_GIFS, USER_GIFS, Panel, fit, tilde
 
 try:
     from PIL import Image, ImageSequence
@@ -26,7 +25,7 @@ except Exception:                  # Pillow missing: built-in effects still work
 
 BUILTINS = ["plasma", "rain", "donut", "wave"]
 _PLASMA_STYLES: dict = {}
-DEFAULT_FOLDER = SCRIPTS_DIR / "gifs"          # the repo's own gifs/ folder
+DEFAULT_FOLDER = USER_GIFS                      # the user's own gifs; the ones shipped with mon are listed after them
 
 
 class GifPanel(Panel):
@@ -35,7 +34,7 @@ class GifPanel(Panel):
     interval = 0.1
     takes_enter = True
     help = {"↑ ↓ ⏎": "choose / play", "a": "pause", "b": "back to list", "x": "hide panel (g shows)", "click": "select · pause · buttons"}
-    options = {"folder": f"folder with .gif files (default {DEFAULT_FOLDER})",
+    options = {"folder": f"folder with .gif files (default {DEFAULT_FOLDER}; the bundled gifs are always listed too)",
                "file": "gif (or built-in effect name) to start playing; default: show the list",
                "fps": "frame cap (default 8; GIF frame delays are respected below this)",
                "hidden": "true/false — start hidden, g shows it"}
@@ -67,11 +66,22 @@ class GifPanel(Panel):
         self._set_interval()
 
     # ------------------------------------------------------------------ browsing / loading
+    @staticmethod
+    def _gifs(folder: str) -> list[str]:
+        return sorted(glob.glob(os.path.join(folder, "*.gif")) + glob.glob(os.path.join(folder, "*.GIF")),
+                      key=lambda p: os.path.basename(p).lower())
+
     def rescan(self) -> None:
-        os.makedirs(self.folder, exist_ok=True)
-        files = sorted(glob.glob(os.path.join(self.folder, "*.gif")) + glob.glob(os.path.join(self.folder, "*.GIF")),
-                       key=lambda p: os.path.basename(p).lower())
-        self.items = [(os.path.basename(p), p) for p in files] + [(f"✦ {e}", e) for e in BUILTINS]
+        try:
+            os.makedirs(self.folder, exist_ok=True)
+        except OSError:
+            pass
+        own = self._gifs(self.folder)
+        bundled = [] if os.path.realpath(self.folder) == os.path.realpath(str(BUNDLED_GIFS)) else self._gifs(str(BUNDLED_GIFS))
+        names = {os.path.basename(p) for p in own}
+        self.items = ([(os.path.basename(p), p) for p in own]
+                      + [(f"· {os.path.basename(p)}", p) for p in bundled if os.path.basename(p) not in names]
+                      + [(f"✦ {e}", e) for e in BUILTINS])
         self.sel = max(0, min(self.sel, len(self.items) - 1))
 
     def _set_interval(self) -> None:

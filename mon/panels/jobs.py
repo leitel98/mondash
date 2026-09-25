@@ -8,7 +8,7 @@ import time
 from rich.console import Group
 from rich.text import Text
 
-from ..core import Panel, bar, duration, fit, human, rate
+from ..core import Panel, bar, density, duration, entry_rows, finished_rows, fit, human, rate
 from ..jobs import Job, JobTracker
 
 GLYPH = {"gradle": "⚙", "expo": "⚙", "compile": "⚒", "link": "⚒", "build": "⚙", "script": "▶", "test": "✓", "lint": "✓",
@@ -25,17 +25,25 @@ class JobsPanel(Panel):
                "busy_cpu": "CPU % a process must hold to count as busy (default 40)",
                "busy_after": "seconds it must hold it (default 8)",
                "busy_ignore": "extra process names to never list as busy",
+               "tools": "table of extra programs that are jobs on this machine: process name → kind "
+                        "(compile link build test container media archive copy backup system python vcs ml db vm iac script)",
+               "ignore": "process names never to count as a job",
                "finished": "how many finished jobs to keep on screen (default 4)"}
 
     def __init__(self, cfg, theme):
         super().__init__(cfg, theme)
-        ignore = self.cfg.get("busy_ignore") or []
+        tools = self.cfg.get("tools") or {}
         self.tracker = JobTracker(busy=bool(self.cfg.get("busy", True)), busy_cpu=float(self.cfg.get("busy_cpu", 40)),
-                                  busy_after=float(self.cfg.get("busy_after", 8)),
-                                  busy_ignore=set(ignore) if isinstance(ignore, list) else {str(ignore)})
+                                  busy_after=float(self.cfg.get("busy_after", 8)), busy_ignore=set(self._list("busy_ignore")),
+                                  tools={str(k): str(v) for k, v in tools.items()} if isinstance(tools, dict) else {},
+                                  ignore=set(self._list("ignore")))
         self.show_busy = bool(self.cfg.get("busy", True))
         self.keep_finished = int(self.cfg.get("finished", 4))
         self._sig: tuple = ()
+
+    def _list(self, key: str) -> list[str]:
+        v = self.cfg.get(key) or []
+        return [str(x) for x in (v if isinstance(v, list) else [v])]
 
     def sample(self, dt: float):
         self.tracker.scan(dt)
@@ -83,11 +91,8 @@ class JobsPanel(Panel):
             extra += 1 + min(len(busy), 3)
         if finished:
             extra += 1 + len(finished)
-        avail = height
-        per = 3 if n * 3 + extra <= avail else 2 if n * 2 + extra <= avail else 1
-        if per == 1 and n + extra > avail:
-            extra = 0
-        body_h = max(1, avail - extra)
+        per, extra = density(n, height, extra)
+        body_h = max(1, height - extra)
         shown = jobs if n * per <= body_h else jobs[: max(0, body_h // per - 1)]
         stats_w = max((len(self._stats(j).plain) for j in shown), default=0)
         for j in shown:
@@ -104,11 +109,7 @@ class JobsPanel(Panel):
                 line.overflow = "ellipsis"
                 rows.append(line)
         if finished and extra and len(rows) < height:
-            rows.append(Text("finished:", style=th.dim))
-            for when, name, secs, kind in finished[: height - len(rows)]:
-                line = Text.assemble((f"{when} ", th.dim), ("✔ ", th.good), fit(name, max(4, width - 18)), (f" {duration(secs)}", th.dim))
-                line.no_wrap = True
-                rows.append(line)
+            rows.extend(finished_rows([(w, nm, duration(secs)) for w, nm, secs, _ in finished], width, th, height - len(rows)))
         return Group(*rows[:height])
 
     def _stats(self, j: Job) -> Text:
@@ -138,44 +139,24 @@ class JobsPanel(Panel):
         th = self.theme
         glyph = GLYPH.get(j.kind, "●") + " "
         stage = f" · {j.stage}" if j.stage and j.stage != j.label.split(" ")[0] else ""
-        stats = self._stats(j)
-        frac = j.frac
         name_style = "bold" if j.finite else "magenta"
         if per == 1:
-            bar_w = max(0, min(20, width // 4))
-            name_w = max(8, width - bar_w - max(stats_w, len(stats.plain)) - 4)
-            line = Text.assemble((glyph, name_style), (fit(j.name + stage, name_w).ljust(name_w), name_style), " ")
-            if bar_w >= 4:
-                line.append_text(self._bar(j, bar_w))
-                line.append(" ")
-            line.append_text(stats)
-            line.no_wrap = True
-            return [line]
-        head_tail = f"  {j.kind} · {duration(j.elapsed)}"
-        head = Text.assemble((glyph, name_style), (fit(j.name, max(6, width - len(stage) - len(head_tail) - 2)), name_style),
-                             (stage, th.accent), (head_tail, th.dim))
-        head.no_wrap = True
-        if per == 2:
-            bar_w = max(0, width - len(stats.plain) - 1)
-            line = Text(no_wrap=True)
-            if bar_w >= 6:
-                line.append_text(self._bar(j, bar_w))
-                line.append(" ")
-            line.append_text(stats)
-            return [head, line]
-        out = [head, self._bar(j, width)]
-        tail = Text(no_wrap=True)
-        tail.append_text(stats)
+            return entry_rows(1, glyph, j.name + stage, name_style, "", self._stats(j), width, th,
+                              bar_fn=lambda w: self._bar(j, w), stats_w=stats_w)
+        tail = ""
         if j.est_runs:
-            note = f"  · median of {j.est_runs} run{'s' if j.est_runs > 1 else ''}: {duration(j.est_total)}"
-            if len(tail.plain) + len(note) <= width:
-                tail.append(note, th.dim)
-        elif frac is None and j.members:
-            note = f"  · {len(j.members)} processes"
-            if len(tail.plain) + len(note) <= width:
-                tail.append(note, th.dim)
-        out.append(tail)
-        return out
+            tail = f"  · median of {j.est_runs} run{'s' if j.est_runs > 1 else ''}: {duration(j.est_total)}"
+        elif j.frac is None and j.members:
+            tail = f"  · {len(j.members)} processes"
+        rows = entry_rows(per, glyph, j.name, name_style, f"  {j.kind} · {duration(j.elapsed)}", self._stats(j), width, th,
+                          bar_fn=lambda w: self._bar(j, w), tail_note=tail)
+        if stage:                                        # the stage word sits between the name and the note, in accent
+            note = f"  {j.kind} · {duration(j.elapsed)}"
+            head = Text.assemble((glyph, name_style), (fit(j.name, max(6, width - len(stage) - len(note) - 2)), name_style),
+                                 (stage, th.accent), (note, th.dim))
+            head.no_wrap = True
+            rows[0] = head
+        return rows
 
     def _bar(self, j: Job, width: int) -> Text:
         """Estimated progress bar when history exists; otherwise a slow sweep so the eye still sees motion."""

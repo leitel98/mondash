@@ -9,15 +9,16 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import statistics
 import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .host import HOME, boot_time
 from .procscan import CLK_TCK, SCANNER, Snapshot
 
-HOME = str(Path.home())
 HOME_REAL = os.path.realpath(HOME)
 CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "mon"
 HISTORY_FILE = CACHE_DIR / "jobs.json"
@@ -88,7 +89,7 @@ BUSY_IGNORE = {"firefox", "firefox-bin", "chrome", "chromium", "chromium-browse"
                "ptyxis", "tmux: server", "mondash", "dlwatch", "btop", "htop", "top", "glances", "nvtop"}
 
 
-_GRADLE_TASK_RE = __import__("re").compile(r"(:?[A-Za-z][\w-]*)(:[A-Za-z][\w-]*)*")
+_GRADLE_TASK_RE = re.compile(r"(:?[A-Za-z][\w-]*)(:[A-Za-z][\w-]*)*")
 
 
 def _positional(args: list[str]) -> list[str]:
@@ -113,11 +114,16 @@ class Det:
     stage: str = ""      # word this process contributes as a stage when it is a member of a bigger job
 
 
-def classify(comm: str, args: list[str]) -> Det | None:
+KINDS = ("compile", "link", "build", "test", "lint", "container", "media", "archive", "copy", "backup", "system", "python",
+         "vcs", "ml", "db", "vm", "iac", "script", "gradle", "expo")
+
+
+def classify(comm: str, args: list[str], finite: dict[str, str] = FINITE) -> Det | None:
     """Decide whether one process is (part of) a job. comm is the /proc name (15 chars), args the command
-    line without argv[0]. Returns None for everything that is not work in progress or belongs to `dl`."""
-    if comm in FINITE:
-        kind = FINITE[comm]
+    line without argv[0]. Returns None for everything that is not work in progress or belongs to `dl`.
+    `finite` is the name → kind table; a user's extra tools from dash.toml are merged into it."""
+    if comm in finite:
+        kind = finite[comm]
         verb = ""
         if comm in ("cargo", "make", "gmake", "ninja", "cmake", "mvn", "gradle", "dotnet", "docker", "podman", "flutter", "dart",
                     "git", "dnf", "dnf5", "dnf-3", "rpm-ostree", "bootc", "apt", "apt-get", "pacman", "zypper", "nix", "poetry",
@@ -428,18 +434,7 @@ class History:
         self.dirty = False
 
 
-def _boot_time() -> float:
-    try:
-        with open("/proc/stat") as fh:
-            for line in fh:
-                if line.startswith("btime "):
-                    return float(line.split()[1])
-    except OSError:
-        pass
-    return time.time() - time.monotonic()
-
-
-BOOT = _boot_time()
+BOOT = boot_time()
 
 
 def proc_started(row: dict) -> float:
@@ -478,8 +473,18 @@ class JobTracker:
     IO_MEMBERS_CAP = 160       # read /proc/pid/io for at most this many processes per job
 
     def __init__(self, busy: bool = True, busy_cpu: float = 40.0, busy_after: float = 8.0,
-                 busy_ignore: set[str] | None = None, history: History | None = None) -> None:
+                 busy_ignore: set[str] | None = None, history: History | None = None,
+                 tools: dict[str, str] | None = None, ignore: set[str] | None = None) -> None:
+        """`tools` maps extra process names to a kind (a user's own encoder, build tool, …); `ignore` names
+        processes that must never be a job, whatever the built-in tables say."""
         self.me = os.getpid()
+        self.finite = dict(FINITE)
+        for name, kind in (tools or {}).items():
+            self.finite[name[:15]] = kind if kind in KINDS else "script"
+        self.ignore = {n[:15] for n in (ignore or set())}
+        for name in self.ignore:
+            self.finite.pop(name, None)
+        self.known = set(self.finite) | (CMDLINE_TOOLS - self.ignore)
         self.active: dict[int, Job] = {}
         self.finished: deque[tuple[str, str, float, str]] = deque(maxlen=12)       # (hh:mm:ss, name, seconds, kind)
         self.history = history if history is not None else History()
@@ -517,19 +522,19 @@ class JobTracker:
             return self.dets[key]
         comm = row["name"]
         det = None
-        if not row["kernel"] and row["st"] != "Z":
-            known = comm in FINITE or comm in CMDLINE_TOOLS
+        if not row["kernel"] and row["st"] != "Z" and comm not in self.ignore:
+            known = comm in self.known
             if not known and (comm in ODD_COMMS or comm.startswith(("npm ", "yarn ", "pnpm ", "bun ")) or len(comm) >= 15):
                 # thread names and rewritten titles: fall back to the program in argv[0]
                 cmd = SCANNER.cmdline(row)
                 argv0 = os.path.basename(cmd.split(" ", 1)[0]) if cmd and not cmd.startswith("[") else ""
-                if argv0 in FINITE or argv0 in CMDLINE_TOOLS:
+                if argv0 in self.known:
                     comm, known = argv0, True
             if known:
                 cmd = SCANNER.cmdline(row)
                 args = cmd.split(" ")[1:] if cmd and not cmd.startswith("[") else []
                 try:
-                    det = classify(comm, args)
+                    det = classify(comm, args, self.finite)
                 except Exception:
                     det = None
         self.dets[key] = det

@@ -1,0 +1,60 @@
+# On a tag like v1.2.0: build the sdist/wheel and a single-file binary per architecture, attach them to a
+# GitHub release. Python builds on manylinux_2_28 so the binary runs on any distro with glibc 2.28+ (2018+).
+name: release
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+jobs:
+  wheel:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install build && python -m build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel
+          path: dist/*
+  binary:
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    container: quay.io/pypa/manylinux_2_28_${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: build one-file binary
+        run: |
+          /opt/python/cp312-cp312/bin/python -m venv .venv
+          . .venv/bin/activate
+          pip install --upgrade pip pyinstaller ".[gif]"
+          pyinstaller --onefile --name mondash --collect-data mon --hidden-import mon.panels \
+            --copy-metadata mondash --strip --clean mon/__main__.py
+          mv dist/mondash "dist/mondash-linux-${{ matrix.arch }}"
+          "dist/mondash-linux-${{ matrix.arch }}" --version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.arch }}
+          path: dist/mondash-linux-*
+  publish:
+    needs: [wheel, binary]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+      - name: checksums
+        run: cd out && sha256sum * > SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: out/*
+          generate_release_notes: true

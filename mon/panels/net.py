@@ -7,18 +7,7 @@ import psutil
 from rich.console import Group
 from rich.text import Text
 
-from ..core import Hist, Panel, braille_graph, human, kv_line, nice_max, rate, read_file, sparkline
-
-
-def default_iface() -> str | None:
-    try:
-        for line in open("/proc/net/route").read().splitlines()[1:]:
-            parts = line.split()
-            if parts[1] == "00000000":
-                return parts[0]
-    except OSError:
-        pass
-    return None
+from ..core import Hist, Panel, braille_graph, default_iface, human, kv_line, nice_max, rate, read_file, sparkline
 
 
 class NetPanel(Panel):

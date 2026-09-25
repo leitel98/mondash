@@ -13,17 +13,31 @@ jobs (everything being processed: builds, compilers, bundlers, test runs, encode
 
 ## Install
 
+Pick one:
+
 ```
-git clone https://github.com/leitel98/mondash.git ~/Projects/mondash
-pip install --user rich psutil pillow
-~/Projects/mondash/install.sh        # symlinks the launchers into ~/.local/bin, adds desktop entries
-mondash                              # config appears at ~/.config/mon/dash.toml on first run
+pipx install mondash                 # or: uv tool install mondash
 ```
 
-Everything lives in the cloned folder: the `mon` package, the launchers, `dlwatch`, and a `gifs/`
-folder the animation panel lists by default (drop your own `.gif` files there). Requires Python
-3.11+ and a terminal with true colour and mouse support (Konsole, kitty, foot, Alacritty, GNOME
-Terminal, …). `./install.sh --uninstall` removes the links again.
+That puts `mondash`, `dlwatch` and the single monitors (`cpumon`, `memmon`, `netmon`, `diskmon`, `procmon`,
+`gpumon`, `tempmon`, `powermon`, `sysmon`, `dlmon`, `cmdmon`, `hwmon`, `gifmon`, `jobsmon`) on your PATH.
+Add `mondash[gif]` to get GIF playback in the animation panel (needs Pillow).
+
+Or download a single-file binary from the [releases page](https://github.com/leitel98/mondash/releases)
+(`mondash-linux-x86_64` or `mondash-linux-aarch64`), make it executable, and run it. Everything is in that one
+file: `mondash` is the dashboard, `mondash cpu` a single monitor, `mondash dlwatch` the download watcher.
+
+From a checkout:
+
+```
+git clone https://github.com/leitel98/mondash.git && cd mondash
+./install.sh                         # pipx / uv / pip --user, whichever you have, plus desktop entries
+python3 -m mon                       # or run it straight from the folder (needs rich and psutil)
+```
+
+The config appears at `~/.config/mon/dash.toml` on first run; your own `.gif` files go in `~/.config/mon/gifs`.
+Requires Linux, Python 3.11+ and a terminal with true colour and mouse support (Konsole, kitty, foot, Alacritty,
+GNOME Terminal, Ptyxis, …). `./install.sh --uninstall` removes it again.
 
 ## Mouse
 
@@ -80,7 +94,9 @@ characters, thresholds and the box style live under `[theme]`.
 
 Subclass `mon.core.Panel` in a new file under `mon/panels/`, implement `sample(dt)` and
 `render(width, height)`, register it in `mon/panels/__init__.py`. Helpers in `mon.core`:
-`braille_graph`, `sparkline`, `bar`, `meter`, `kv_line`, `Hist`, `human`, `rate`.
+`braille_graph`, `sparkline`, `bar`, `meter`, `kv_line`, `Hist`, `human`, `rate`; readers for `/proc` and `/sys`
+live in `mon.host`. `python3 -m unittest discover -s mon/tests -t .` renders every panel at several sizes and
+composes every layout, so a new panel that overflows its box fails the suite.
 
 ## Cost
 
@@ -126,13 +142,49 @@ Steam starts moving files into the game folder, a `committed N%` note. If nothin
 10 seconds the entry says `stalled`; Steam pauses downloads while a game is running unless
 you allow downloads during gameplay in its settings.
 
+## Making it recognise your programs
+
+The jobs and downloads panels know a few hundred tools by name (see `mon/jobs.py` and `mon/dlwatch.py`), but your
+machine runs things mine does not. `mondash --doctor` prints what the panels can see on this machine (sensors,
+GPU backend, battery, Steam libraries, terminal) and, more usefully, which running processes are burning CPU
+without being recognised. Teach it in `dash.toml`:
+
+```toml
+[panels.jobs]
+tools = { myencoder = "media", buildthing = "build" }   # process name → kind
+ignore = ["cat"]                                        # never a job
+busy_ignore = ["blender"]                               # never in the busy list
+
+[panels.dl]
+tools = ["axel", "lftp"]                                # extra downloaders (they get a bar when an output file is found)
+ignore = ["rsync"]
+```
+
+Kinds for jobs: `compile link build test lint container media archive copy backup system python vcs ml db vm iac script`.
+Process names are what `/proc` shows (the first 15 characters of the executable name). If something common is
+missing, open an issue with the `--doctor` output and it goes into the built-in tables.
+
 ## Portability
 
 Nothing is hard-coded to this machine. Every number is read at run time from `/proc`, `/sys`
 (hwmon, cpufreq, drm, power_supply, block, dmi), udev's DMI export (`udevadm info`), `lspci`,
 the NVIDIA driver (NVML, falling back to `nvidia-smi`), the amdgpu and i915 sysfs interfaces,
-and Steam's own manifest files found through `libraryfolders.vdf`. Panels degrade when a
-source is missing: no battery → the power panel shows AC and governor only, no discrete GPU →
-the integrated one, no sensors → "no temperature sensors". Requirements are Linux, Python
-3.11+, `rich`, `psutil`, and optionally `pillow` for GIF playback. AMD GPU support is written
+and Steam's own manifest files found through `libraryfolders.vdf` (native, Flatpak and Snap installs). Panels
+degrade when a source is missing: no battery → the power panel shows AC and governor only, no discrete GPU →
+the integrated one, no sensors → "no temperature sensors", no default route → the busiest interface. A panel that
+throws keeps the dashboard running and shows the error in its own frame until the next good sample. Requirements
+are Linux, Python 3.11+, `rich`, `psutil`, and optionally `pillow` for GIF playback. AMD GPU support is written
 against the documented sysfs files but was not exercised here (this machine has NVIDIA + Intel).
+
+## Development and releases
+
+```
+git clone https://github.com/leitel98/mondash.git && cd mondash
+pip install -e ".[gif]"                                # editable install: edits take effect immediately
+python3 -m unittest discover -s mon/tests -t .         # classifier tests + headless render of every panel and layout
+```
+
+Pushing a tag `vX.Y.Z` runs the release workflow: it builds the wheel and sdist, a one-file binary for x86_64 and
+aarch64 (built on manylinux_2_28, so they run on any distro from 2018 on), and attaches them to a GitHub release.
+`pypi.yml` publishes the same tag to PyPI once a trusted publisher is configured for this repository on pypi.org.
+The version lives in `mon/__init__.py`.

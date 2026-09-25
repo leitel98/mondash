@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import argparse
-import math
 import sys
 import time
 import traceback
@@ -15,7 +14,8 @@ from rich.segment import Segment
 from rich.table import Table
 from rich.text import Text
 
-from .core import CONFIG_FILE, Keys, Panel, Screen, Theme, frame, load_config, make_panel, relaunch_in_window
+from . import __version__
+from .core import CONFIG_FILE, Keys, Panel, Screen, Theme, frame, load_config, make_panel, relaunch_in_window, self_argv
 
 # ----------------------------------------------------------------------------- grid
 
@@ -140,8 +140,10 @@ OVERLAYS = {"H": "hw"}      # key -> panel type shown full screen on demand, wha
 
 
 class Dashboard:
-    def __init__(self, config_path: Path | None, layout: str | None) -> None:
+    def __init__(self, config_path: Path | None, layout: str | None, conf: dict | None = None) -> None:
+        """Reads dash.toml at config_path (default ~/.config/mon/dash.toml); `conf` bypasses the file (tests)."""
         self.config_path = config_path or CONFIG_FILE
+        self._conf_override = conf
         self.panels: dict[str, Panel] = {}
         self.layout_names: list[str] = []
         self.layout_idx = 0
@@ -169,8 +171,12 @@ class Dashboard:
                     break
 
     # config ------------------------------------------------------------------
+    @classmethod
+    def from_config(cls, conf: dict, layout: str | None = None) -> "Dashboard":
+        return cls(None, layout, conf=conf)
+
     def load(self, layout: str | None = None) -> None:
-        conf = load_config(self.config_path)
+        conf = self._conf_override if self._conf_override is not None else load_config(self.config_path)
         self.conf = conf
         self.theme = Theme.from_dict(conf.get("theme", {}))
         self.refresh = float(conf.get("refresh", 1.0))
@@ -187,9 +193,6 @@ class Dashboard:
         for p in old.values():
             if p not in self.panels.values():
                 p.close()
-
-    _seen_hidden_cfg: set = set()
-    _seen_layouts: set = set()
 
     def overlay_panel(self) -> Panel | None:
         if not self.overlay:
@@ -539,6 +542,7 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--no-mouse", action="store_true", help="leave the mouse to the terminal")
     ap.add_argument("--print-config", action="store_true", help="print the default config and exit")
     ap.add_argument("--panels", action="store_true", help="list panel types with their options and exit")
+    ap.add_argument("-V", "--version", action="version", version=f"mondash {__version__}")
     a = ap.parse_args(argv)
     if a.print_config:
         from .core import DEFAULT_CONFIG
@@ -552,7 +556,7 @@ def main(argv: list[str] | None = None) -> None:
                 print(f"          {k:<12} {v}")
         return
     if a.window:
-        relaunch_in_window([sys.argv[0]] + [x for x in sys.argv[1:] if x not in ("-w", "--window")], "mondash")
+        relaunch_in_window(self_argv(), "mondash")
         return
     dash = Dashboard(a.config, a.layout)
     if a.no_mouse:

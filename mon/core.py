@@ -21,10 +21,14 @@ from rich.console import Console, Group, RenderableType
 from rich.panel import Panel as RichPanel
 from rich.text import Text
 
-HOME = str(Path.home())
-SCRIPTS_DIR = Path(__file__).resolve().parent.parent
+from .host import (HOME, cached, cpu_temperature, default_iface, read_file, read_int, read_psi,  # noqa: F401 (re-exported)
+                   temperatures, tilde)
+
+PACKAGE_DIR = Path(__file__).resolve().parent
+BUNDLED_GIFS = PACKAGE_DIR / "gifs"                 # shipped with the package (read-only once installed)
 CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "mon"
 CONFIG_FILE = CONFIG_DIR / "dash.toml"
+USER_GIFS = CONFIG_DIR / "gifs"                     # the user's own animations
 
 # ----------------------------------------------------------------------------- formatting
 
@@ -78,10 +82,6 @@ def pad(text: str, width: int, align: str = "left") -> str:
     return text.ljust(width)
 
 
-def tilde(path: str) -> str:
-    return "~" + path[len(HOME):] if path.startswith(HOME) else path
-
-
 def nice_max(v: float, floor: float = 1.0) -> float:
     """Round v up to 1/2/5 × 10^k so graph scales don't jitter."""
     v = max(v, floor)
@@ -90,21 +90,6 @@ def nice_max(v: float, floor: float = 1.0) -> float:
         if v <= m * exp:
             return m * exp
     return 10 * exp
-
-
-def read_file(path: str | Path, default: str | None = None) -> str | None:
-    try:
-        return Path(path).read_text().strip()
-    except OSError:
-        return default
-
-
-def read_int(path: str | Path, default: int | None = None) -> int | None:
-    txt = read_file(path)
-    try:
-        return int(txt) if txt is not None else default
-    except ValueError:
-        return default
 
 
 # ----------------------------------------------------------------------------- theme
@@ -154,6 +139,10 @@ class Theme:
     def level(self, pct: float) -> str:
         lo, hi = (self.thresholds + [60, 85])[:2]
         return self.bad if pct >= hi else self.warn if pct >= lo else self.good
+
+    def temp_style(self, celsius: float, warn: float = 75.0, bad: float = 90.0) -> str:
+        """Colour for a temperature; CPUs use the defaults, GPUs pass their own marks."""
+        return self.bad if celsius >= bad else self.warn if celsius >= warn else self.good
 
 
 # ----------------------------------------------------------------------------- history
@@ -310,36 +299,69 @@ def lines(*items: RenderableType) -> Group:
     return Group(*items)
 
 
-_cache: dict[str, tuple[float, object]] = {}
+# ----------------------------------------------------------------------------- stacked entries (downloads, jobs)
 
 
-def cached(key: str, ttl: float, fn):
-    """Share one expensive read (e.g. all hwmon sensors) between panels that sample in the same tick."""
-    now = time.monotonic()
-    hit = _cache.get(key)
-    if hit and now - hit[0] < ttl:
-        return hit[1]
-    value = fn()
-    _cache[key] = (now, value)
-    return value
+def density(n: int, height: int, extra: int = 0) -> tuple[int, int]:
+    """How many lines each of n entries may take (3, 2 or 1) so they fit in `height` with `extra` lines of
+    sections below them. Returns (per_entry, extra_kept): the sections are dropped when even 1 line per
+    entry would not leave room for them."""
+    per = 3 if n * 3 + extra <= height else 2 if n * 2 + extra <= height else 1
+    if per == 1 and n + extra > height:
+        extra = 0
+    return per, extra
 
 
-def temperatures() -> dict:
-    import psutil
-    return cached("temps", 0.9, psutil.sensors_temperatures)
+def entry_rows(per: int, glyph: str, name: str, name_style: str, head_note: str, stats: Text, width: int,
+               theme: Theme, bar_fn=None, stats_w: int = 0, tail_note: str = "") -> list[Text]:
+    """1, 2 or 3 lines for one entry, the same shape the downloads and jobs panels use:
+
+        per=1   ◆ name……………  ████░░  stats
+        per=2   ◆ name                       head_note
+                ████████████████░░░░░  stats
+        per=3   head, a full-width bar, then stats + tail_note
+
+    bar_fn(width) draws the bar for a given width (None: no bar). stats_w aligns the stats column across
+    entries in the one-line layout."""
+    if per == 1:
+        bar_w = max(0, min(20, width // 4)) if bar_fn else 0
+        name_w = max(8, width - bar_w - max(stats_w, len(stats.plain)) - 4)
+        line = Text.assemble((glyph, name_style), (fit(name, name_w).ljust(name_w), name_style), " ")
+        if bar_fn and bar_w >= 4:
+            line.append_text(bar_fn(bar_w))
+            line.append(" ")
+        line.append_text(stats)
+        line.no_wrap = True
+        return [line]
+    head = Text.assemble((glyph, name_style), (fit(name, max(6, width - len(head_note) - 2)), name_style), (head_note, theme.dim))
+    head.no_wrap = True
+    if per == 2:
+        bar_w = max(0, width - len(stats.plain) - 1)
+        line = Text(no_wrap=True)
+        if bar_fn and bar_w >= 6:
+            line.append_text(bar_fn(bar_w))
+            line.append(" ")
+        line.append_text(stats)
+        return [head, line]
+    out = [head, bar_fn(width) if bar_fn else Text(theme.bar_empty * width, style=theme.bar_empty_style)]
+    tail = Text(no_wrap=True)
+    tail.append_text(stats)
+    if tail_note and len(tail.plain) + len(tail_note) <= width:
+        tail.append(tail_note, theme.dim)
+    out.append(tail)
+    return out
 
 
-def read_psi(kind: str) -> str | None:
-    """Pressure-stall 'some avg10' for cpu/memory/io, formatted, or None."""
-    txt = read_file(f"/proc/pressure/{kind}")
-    if not txt:
-        return None
-    for line in txt.splitlines():
-        if line.startswith("some"):
-            for part in line.split():
-                if part.startswith("avg10="):
-                    return part.split("=", 1)[1] + "%"
-    return None
+def finished_rows(entries, width: int, theme: Theme, limit: int) -> list[Text]:
+    """`finished:` section shared by the downloads and jobs panels: (when, name, note) triples."""
+    if limit <= 0 or not entries:
+        return []
+    rows = [Text("finished:", style=theme.dim)]
+    for when, name, note in list(entries)[: limit - 1]:
+        line = Text.assemble((f"{when} ", theme.dim), ("✔ ", theme.good), fit(name, max(4, width - 12 - len(note))), (f" {note}", theme.dim))
+        line.no_wrap = True
+        rows.append(line)
+    return rows
 
 
 # ----------------------------------------------------------------------------- keys
@@ -527,6 +549,9 @@ class Panel:
         self._last = now
         try:
             changed = self.sample(max(0.05, dt))
+            if self._error:                   # a transient failure (a device that went away for a tick) clears itself
+                self._error = None
+                changed = True
         except Exception as exc:  # a broken sensor must never take the dashboard down
             self._error = repr(exc)
             changed = True
@@ -698,6 +723,8 @@ interval = 2.0
 
 [panels.dl]
 interval = 1.0
+# tools = ["axel", "lftp"]  # extra programs that are downloads on this machine (process names; `mondash --doctor` lists candidates)
+# ignore = ["rsync"]        # never list these
 
 [panels.jobs]
 interval = 1.0
@@ -705,13 +732,16 @@ busy = true                 # also list processes burning CPU that are not a rec
 # busy_cpu = 40             # CPU % a process must hold, for busy_after seconds, to be listed there
 # busy_after = 8
 # busy_ignore = ["blender"] # names never listed as busy (browsers, compositors, players and VMs already are)
+# tools = { myencoder = "media", buildthing = "build" }   # extra programs that are jobs: process name → kind
+#                           # kinds: compile link build test lint container media archive copy backup system python vcs ml db vm iac script
+# ignore = ["cat"]          # never a job, even if built in
 finished = 4                # finished jobs kept on screen (`c` clears)
 
 [panels.hw]
 # sections = ["system", "cpu", "memory", "gpu", "storage", "network", "audio", "display", "battery", "os"]
 
 [panels.gif]
-# folder = "~/Pictures/gifs"           # default: the gifs/ folder next to mondash; the panel lists it (plus built-in effects)
+# folder = "~/Pictures/gifs"           # default: ~/.config/mon/gifs; the gifs shipped with mondash and the built-in effects are listed too
 # file = "plasma"                      # start playing this gif path or effect instead of showing the list
 fps = 8
 hidden = false                         # start hidden; `g` or the panel's ✕ button toggles it
@@ -725,14 +755,25 @@ hidden = false                         # start hidden; `g` or the panel's ✕ bu
 '''
 
 
+def default_config() -> dict:
+    import tomllib
+    return tomllib.loads(DEFAULT_CONFIG)
+
+
 def load_config(path: Path | None = None) -> dict:
     import tomllib
     path = path or CONFIG_FILE
     if not path.exists():
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(DEFAULT_CONFIG)
-    with open(path, "rb") as fh:
-        return tomllib.load(fh)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(DEFAULT_CONFIG)
+        except OSError:
+            return default_config()          # read-only home (sandbox, CI): run with the defaults
+    try:
+        with open(path, "rb") as fh:
+            return tomllib.load(fh)
+    except tomllib.TOMLDecodeError as exc:
+        raise SystemExit(f"mon: cannot parse {path}: {exc}")
 
 
 # ----------------------------------------------------------------------------- registry
@@ -775,14 +816,33 @@ def parse_sets(items: list[str] | None) -> dict:
     return out
 
 
-def relaunch_in_window(argv: list[str], title: str) -> None:
-    for term, pre in (("konsole", ["konsole", "--title", title, "-e"]), ("ptyxis", ["ptyxis", "--"]),
-                      ("gnome-terminal", ["gnome-terminal", "--"]), ("kitty", ["kitty", "--title", title]),
-                      ("alacritty", ["alacritty", "-T", title, "-e"]), ("xterm", ["xterm", "-T", title, "-e"])):
+TERMINALS = (("konsole", ["konsole", "--title", "{title}", "-e"]), ("ptyxis", ["ptyxis", "--"]),
+             ("gnome-terminal", ["gnome-terminal", "--"]), ("kitty", ["kitty", "--title", "{title}"]),
+             ("foot", ["foot", "-T", "{title}"]), ("wezterm", ["wezterm", "start", "--"]),
+             ("alacritty", ["alacritty", "-T", "{title}", "-e"]), ("xfce4-terminal", ["xfce4-terminal", "-T", "{title}", "-x"]),
+             ("tilix", ["tilix", "-t", "{title}", "-e"]), ("xterm", ["xterm", "-T", "{title}", "-e"]))
+
+
+def find_terminal(title: str) -> list[str] | None:
+    """Command prefix that opens a new terminal window running what follows it; $TERMINAL first."""
+    want = os.environ.get("TERMINAL")
+    order = ([(want, [want, "-e"])] if want and shutil.which(want) else []) + list(TERMINALS)
+    for term, pre in order:
         if shutil.which(term):
-            subprocess.Popen(pre + argv, start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            return
-    sys.exit("mon: no terminal emulator found")
+            return [p.replace("{title}", title) for p in pre]
+    return None
+
+
+def relaunch_in_window(argv: list[str], title: str) -> None:
+    pre = find_terminal(title)
+    if pre is None:
+        sys.exit("mon: no terminal emulator found (set $TERMINAL)")
+    subprocess.Popen(pre + argv, start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def self_argv(drop: tuple[str, ...] = ("-w", "--window")) -> list[str]:
+    """This process's command line minus the given flags, for re-running ourselves in a new window."""
+    return [sys.argv[0]] + [x for x in sys.argv[1:] if x not in drop]
 
 
 def run_standalone(kind: str, argv: list[str] | None = None) -> None:
@@ -812,7 +872,7 @@ def run_standalone(kind: str, argv: list[str] | None = None) -> None:
                 print(f"  {k:<14} {v}")
         return
     if a.window:
-        relaunch_in_window([sys.argv[0]] + [x for x in sys.argv[1:] if x not in ("-w", "--window")], cls.title)
+        relaunch_in_window(self_argv(), cls.title)
         return
 
     conf = load_config(a.config)

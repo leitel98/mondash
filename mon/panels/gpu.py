@@ -2,13 +2,15 @@
 from __future__ import annotations
 
 import glob
+import os
+import subprocess
 import time
 
 from rich.console import Group
 from rich.text import Text
 
 from . import _nvidia
-from ..core import Hist, Panel, bar, braille_graph, fit, human, kv_line, meter, pad, read_file, read_int, sparkline
+from ..core import Hist, Panel, braille_graph, fit, kv_line, meter, pad, read_file, read_int, sparkline
 
 
 class IntelGpu:
@@ -63,8 +65,7 @@ class AmdGpu:
         name = read_file(f"{self.dev}/product_name") or ""
         if not name:
             try:
-                import subprocess
-                slot = self.dev and glob.os.path.basename(glob.os.path.realpath(self.dev)).split(":", 1)[-1]
+                slot = os.path.basename(os.path.realpath(self.dev)).split(":", 1)[-1]
                 for line in subprocess.run(["lspci", "-mm", "-s", slot], capture_output=True, text=True, timeout=3).stdout.splitlines():
                     parts = [p.strip('"') for p in line.split('" "')]
                     if len(parts) >= 4:
@@ -150,7 +151,7 @@ class GpuPanel(Panel):
             head = Text.assemble((fit(a.name, max(6, width // 2)), f"bold {th.accent}"), "  ")
             facts = []
             if a.temp is not None:
-                facts.append(("", f"{a.temp:.0f}°C", th.bad if a.temp >= 90 else th.warn if a.temp >= 75 else th.good))
+                facts.append(("", f"{a.temp:.0f}°C", th.temp_style(a.temp)))
             if a.power is not None:
                 facts.append(("", f"{a.power:.0f}W", None))
             if a.freq:
@@ -169,7 +170,7 @@ class GpuPanel(Panel):
             facts = []
             t = g.get("temperature.gpu")
             if t is not None:
-                facts.append(("", f"{t:.0f}°C", th.bad if t >= 85 else th.warn if t >= 70 else th.good))
+                facts.append(("", f"{t:.0f}°C", th.temp_style(t, 70, 85)))
             pw = g.get("power.draw")
             if pw is not None:
                 lim = g.get("power.limit")

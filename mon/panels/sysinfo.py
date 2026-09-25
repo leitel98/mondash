@@ -9,15 +9,8 @@ import psutil
 from rich.console import Group
 from rich.text import Text
 
-from ..core import Panel, duration, human, read_file, read_psi, temperatures
-
-
-def os_name() -> str:
-    txt = read_file("/etc/os-release") or ""
-    for line in txt.splitlines():
-        if line.startswith("PRETTY_NAME="):
-            return line.split("=", 1)[1].strip('"')
-    return platform.system()
+from ..core import Panel, duration, human, read_psi
+from ..host import cpu_temperature, os_name
 
 
 class SysPanel(Panel):
@@ -39,16 +32,14 @@ class SysPanel(Panel):
         self.temp: float | None = None
         self.disk: tuple[str, float, int] | None = None
         self.bat: tuple[int, bool] | None = None
-        self.disk_mount = self.cfg.get("disk", next((m for m in ("/var/home", "/home", "/") if os.path.ismount(m)), "/"))
+        self.disk_mount = self.cfg.get("disk") or next((m for m in ("/var/home", "/home", "/") if os.path.ismount(m)), "/")
 
     def sample(self, dt: float) -> None:
         self.load = os.getloadavg()
         self.tasks = len(psutil.pids())
         parts = [f"{k} {v}" for k, v in (("cpu", read_psi("cpu")), ("mem", read_psi("memory")), ("io", read_psi("io"))) if v]
         self.psi = " ".join(parts)
-        temps = [e.current for chip in ("coretemp", "k10temp", "zenpower", "cpu_thermal")
-                 for e in temperatures().get(chip, [])]
-        self.temp = max(temps) if temps else None
+        self.temp = cpu_temperature()
         try:
             u = psutil.disk_usage(self.disk_mount)
             self.disk = (self.disk_mount, u.percent, u.free)
@@ -69,7 +60,7 @@ class SysPanel(Panel):
             "load": Text.assemble(("load ", th.dim), " ".join(f"{x:.2f}" for x in self.load)),
             "tasks": Text.assemble(("tasks ", th.dim), str(self.tasks)),
             "psi": Text.assemble(("psi ", th.dim), self.psi) if self.psi else None,
-            "temp": Text.assemble(("cpu ", th.dim), (f"{self.temp:.0f}°C", th.bad if self.temp >= 90 else th.warn if self.temp >= 75 else th.good)) if self.temp is not None else None,
+            "temp": Text.assemble(("cpu ", th.dim), (f"{self.temp:.0f}°C", th.temp_style(self.temp))) if self.temp is not None else None,
             "disk": Text.assemble((f"{self.disk[0]} ", th.dim), (f"{self.disk[1]:.0f}%", th.level(self.disk[1])), (f" · {human(self.disk[2])} free", th.dim)) if self.disk else None,
             "bat": Text.assemble(("bat ", th.dim), (f"{self.bat[0]}%", th.good if self.bat[0] > 30 else th.bad), (" ⚡" if self.bat[1] else "", th.good)) if self.bat else None,
             "clock": Text(time.strftime("%H:%M:%S"), style="bold"),

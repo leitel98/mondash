@@ -3,12 +3,14 @@ from __future__ import annotations
 
 import math
 import os
+import time
 
 import psutil
 from rich.console import Group
 from rich.text import Text
 
 from ..core import Hist, Panel, bar, braille_graph, duration, kv_line, pad, read_file, read_psi, sparkline, temperatures
+from ..host import CPU_CHIPS, cpu_model
 
 
 class CpuPanel(Panel):
@@ -33,24 +35,13 @@ class CpuPanel(Panel):
         self.psi: str | None = None
         self.details = True
         self.core_ids = [self._core_id(i) for i in range(self.n)]
-        self.model = self._model()
+        self.model = cpu_model()
         psutil.cpu_percent(percpu=True)
 
     @staticmethod
     def _core_id(i: int) -> int:
         txt = read_file(f"/sys/devices/system/cpu/cpu{i}/topology/core_id")
         return int(txt) if txt and txt.isdigit() else i
-
-    @staticmethod
-    def _model() -> str:
-        txt = read_file("/proc/cpuinfo") or ""
-        for line in txt.splitlines():
-            if line.startswith("model name"):
-                name = line.split(":", 1)[1].strip()
-                for junk in ("(R)", "(TM)", "CPU", "Processor"):
-                    name = name.replace(junk, "")
-                return " ".join(name.split()).split("@")[0].strip()
-        return "CPU"
 
     def sample(self, dt: float) -> None:
         self.per = psutil.cpu_percent(percpu=True)
@@ -66,7 +57,7 @@ class CpuPanel(Panel):
             self.freqs = []
         self.temps = {}
         self.pkg_temp = None
-        for chip in ("coretemp", "k10temp", "zenpower", "cpu_thermal"):
+        for chip in CPU_CHIPS:
             for entry in temperatures().get(chip, []):
                 label = entry.label or ""
                 if label.startswith("Core"):
@@ -90,9 +81,6 @@ class CpuPanel(Panel):
     def status(self) -> str:
         return self.model
 
-    def _temp_style(self, t: float) -> str:
-        return self.theme.bad if t >= 90 else self.theme.warn if t >= 75 else self.theme.good
-
     def render(self, width: int, height: int):
         th = self.theme
         rows: list = []
@@ -100,11 +88,11 @@ class CpuPanel(Panel):
         pct_txt = Text(f"{self.pct:5.1f}%", style=f"bold {th.level(self.pct)}")
         facts = [("", f"{self.freq / 1000:.2f}GHz" if self.freq else "", th.accent)]
         if self.pkg_temp is not None:
-            facts.append(("", f"{self.pkg_temp:.0f}°C", self._temp_style(self.pkg_temp)))
+            facts.append(("", f"{self.pkg_temp:.0f}°C", th.temp_style(self.pkg_temp)))
         facts.append(("load", f"{self.load[0]:.2f} {self.load[1]:.2f} {self.load[2]:.2f}", None))
         if self.psi:
             facts.append(("psi", self.psi, None))
-        facts.append(("up", duration(__import__("time").time() - psutil.boot_time()), None))
+        facts.append(("up", duration(time.time() - psutil.boot_time()), None))
         facts_txt = kv_line([f for f in facts if f[1]], max(0, width - 8 - 22), th)
         bar_w = width - 7 - len(facts_txt.plain) - 2
         header = Text.assemble(pct_txt, " ")
@@ -153,7 +141,7 @@ class CpuPanel(Panel):
                 extra.append(f" {self.freqs[i] / 1000:4.1f}G", th.dim)
             t = self.temps.get(self.core_ids[i])
             if t is not None:
-                extra.append(f" {t:3.0f}°", self._temp_style(t))
+                extra.append(f" {t:3.0f}°", th.temp_style(t))
         val = f"{v:3.0f}%"
         bar_w = width - len(label) - 1 - len(val) - 1 - len(extra.plain)
         out = Text(label, th.dim)
